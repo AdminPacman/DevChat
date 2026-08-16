@@ -10,7 +10,7 @@ graph:
     - id: Planner
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           你是春节新媒体策划。
@@ -36,7 +36,7 @@ graph:
     - id: Copywriter
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           你是官号文案作者。根据 Brief 输出一篇可直接发布的春节推文（Markdown）。
@@ -59,7 +59,7 @@ graph:
     - id: Blessing
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           你是春节祝福语写手。根据 Brief 输出 12 条短祝福（Markdown 列表）：
@@ -80,7 +80,7 @@ graph:
     - id: Storyteller
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           你是短故事写手。根据 Brief 写一个 300-500 字春节小故事（Markdown）。
@@ -99,7 +99,7 @@ graph:
     - id: PosterPrompt
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           根据“最终发布包”，生成海报用的图像生成提示词（prompt pack），要求：
@@ -120,7 +120,7 @@ graph:
     - id: Editor1
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           你是总编辑。你会收到：Brief + 推文 + 祝福语 + 小故事。
@@ -155,7 +155,7 @@ graph:
     - id: Editor2
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           你是二次润色编辑。你会收到“发布包初稿 + 人工修改意见”。

@@ -8,7 +8,7 @@ graph:
     - id: Qwerty
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: Use any available tools or skills - notify if none are available
         base_url: ${BASE_URL}

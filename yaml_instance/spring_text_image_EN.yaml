@@ -10,7 +10,7 @@ graph:
     - id: Planner
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           You are a Spring Festival social media strategist.
@@ -37,7 +37,7 @@ graph:
     - id: Copywriter
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           You are the official account copywriter.
@@ -62,7 +62,7 @@ graph:
     - id: Blessing
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           You are a Spring Festival greeting writer.
@@ -87,7 +87,7 @@ graph:
     - id: Storyteller
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           You are a short story writer.
@@ -110,7 +110,7 @@ graph:
     - id: PosterPrompt
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           Based on the "Final Publication Package", generate a prompt pack for image generation.
@@ -137,7 +137,7 @@ graph:
     - id: Editor1
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           You are the chief editor.
@@ -176,7 +176,7 @@ graph:
     - id: Editor2
       type: agent
       config:
-        name: gpt-4o
+        name: ${MODEL_NAME}
         provider: openai
         role: |
           You are the second-round polishing editor.

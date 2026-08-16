@@ -17,7 +17,7 @@ graph:
         provider: openai
         base_url: ${BASE_URL}
         api_key: ${API_KEY}
-        name: gpt-4o
+        name: ${MODEL_NAME}
         role: |
           # Role
           You are a professional **3D Technical Product Manager**.
@@ -73,7 +73,7 @@ graph:
         provider: openai
         base_url: ${BASE_URL}
         api_key: ${API_KEY}
-        name: gpt-4o
+        name: ${MODEL_NAME}
         role: |
           # Role
           You are the **Technical Planner**.
@@ -117,7 +117,7 @@ graph:
         provider: openai
         base_url: ${BASE_URL}
         api_key: ${API_KEY}
-        name: gpt-4o
+        name: ${MODEL_NAME}
         role: |
           # Identity
           You are a **Procedural Architect** (Blender bpy expert).
@@ -171,7 +171,7 @@ graph:
         provider: openai
         base_url: ${BASE_URL}
         api_key: ${API_KEY}
-        name: gpt-4o
+        name: ${MODEL_NAME}
         role: |
           You are a **Technical Supervisor**.
 
@@ -199,7 +199,7 @@ graph:
         provider: openai
         base_url: ${BASE_URL}
         api_key: ${API_KEY}
-        name: gpt-4o
+        name: ${MODEL_NAME}
         role: |
           You receive: Spec + Plan + Script + Reviewer notes.
 
@@ -230,7 +230,7 @@ graph:
         provider: openai
         base_url: ${BASE_URL}
         api_key: ${API_KEY}
-        name: gpt-4o
+        name: ${MODEL_NAME}
         role: |
           Output Markdown with:
           # 3D Case Summary (1 paragraph)

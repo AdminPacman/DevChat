@@ -1,0 +1,40 @@
+version: 0.4.0
+graph:
+  id: smoke_test_local
+  description: Minimal two-agent smoke test for local Ollama models (no tools required).
+  is_majority_voting: false
+  log_level: INFO
+  start:
+    - Bug Analyst
+  nodes:
+  - id: Bug Analyst
+    type: agent
+    config:
+      provider: openai
+      base_url: ${BASE_URL}
+      api_key: ${API_KEY}
+      name: ${MODEL_NAME}
+      role: |
+        You are a QA analyst for an arcade game project. Given a bug report,
+        restate it precisely, list likely root causes, and rank them by probability.
+        Keep it under 200 words.
+      params:
+        temperature: 0.2
+        max_tokens: 1000
+  - id: Fix Planner
+    type: agent
+    config:
+      provider: openai
+      base_url: ${BASE_URL}
+      api_key: ${API_KEY}
+      name: ${MODEL_NAME}
+      role: |
+        You are a senior game developer. Given the QA analyst's triage, propose a
+        concrete step-by-step debugging plan with the single most likely fix first.
+        Keep it under 200 words.
+      params:
+        temperature: 0.2
+        max_tokens: 1000
+  edges:
+  - from: Bug Analyst
+    to: Fix Planner

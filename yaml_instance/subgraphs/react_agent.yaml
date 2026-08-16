@@ -18,7 +18,7 @@ graph:
       provider: openai
       base_url: ${BASE_URL}
       api_key: ${API_KEY}
-      name: gpt-4o
+      name: ${MODEL_NAME}
       input_mode: messages
       role: |
         You are a ReAct controller, needing to make decisions between the toolbox (web_search, get_webpage_content, execute_code, get_city_num, get_weather) and the final answer.
@@ -42,7 +42,7 @@ graph:
       provider: openai
       base_url: ${BASE_URL}
       api_key: ${API_KEY}
-      name: gpt-4o
+      name: ${MODEL_NAME}
       input_mode: messages
       role: |
         You are the tool executor.
@@ -77,7 +77,7 @@ graph:
       provider: openai
       base_url: ${BASE_URL}
       api_key: ${API_KEY}
-      name: gpt-4o
+      name: ${MODEL_NAME}
       input_mode: messages
       role: |
         You are responsible for receiving the Final Answer from ReAct Brain and combining it with the most recent Observation (if any) to generate a natural language response.
