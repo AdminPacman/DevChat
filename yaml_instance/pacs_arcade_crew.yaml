@@ -1,0 +1,328 @@
+graph:
+  id: pacs_arcade_crew
+  description: >-
+    THE CREW CONSOLE — one graph where the whole Pac's Arcade fleet works in a single
+    watchable room. A local model choreographs; the real work is delegated out to crew
+    members over subprocess seams (claude_run / kimi_run / pi_run), and Pac holds a
+    `type: human` gate before anything is packaged for the outbox.
+
+    Route: Intake -> Planner (Claude writes SPEC.md) -> Builder (Kimi implements) ->
+    Reviewer (Claude judges, writes REVIEW.md) -> [bounded repair loop] -> PAC'S APPROVAL
+    (human) -> Package.
+
+    ⚠️ LAUNCH THIS FROM THE CONSOLE (http://localhost:5173), never by curl. `type: human`
+    nodes only block properly in live web-UI/WebSocket runs; fired headless the gate is
+    not a gate. Unattended work uses the outbox->gate hard stop instead.
+
+    🔒 Kimi is THIRD-PARTY HOSTED (Moonshot may retain/train on what is sent). `kimi_run`
+    pins --skills-dir to the curated bundle and refuses secret-shaped input at the tool
+    level, but the operating rule stands: write every task as if it will be public.
+
+    Everything this graph produces is UNTRUSTED generated output until the
+    gold-in-gold-out gate. It writes ONLY into the run's own code_workspace/ — never into
+    a fleet repo.
+  log_level: INFO
+  is_majority_voting: false
+  nodes:
+    - id: Intake
+      type: passthrough
+      description: Carries the launch task_prompt into the graph unmodified.
+      context_window: 0
+      config: {}
+
+    # --- Planner: Claude turns the raw ask into a written spec ON DISK. Putting the spec in
+    # a file (rather than only in conversation) is deliberate — every later crew member reads
+    # it from the workspace with its own tools, so no node depends on a small local model
+    # faithfully relaying a long brief through the graph's message history.
+    - id: Planner
+      type: agent
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        role: |-
+          You are the Planner node. You do NOT plan anything yourself — you delegate the
+          planning to Claude, who is far stronger at it, and who can write files into this
+          run's workspace.
+
+          Your only job is ONE call to the `claude_run` tool.
+
+          Set `expect_files` to true.
+          Set `timeout_seconds` to 420.
+          Set `task` to exactly this text, with {{TASK}} replaced by the user's task
+          message from this conversation, copied word for word:
+
+          "You are the Planner for a Pac's Arcade crew run. The task is: {{TASK}}
+          Write a file named SPEC.md in the current working directory. SPEC.md must contain:
+          (1) a one-paragraph restatement of what is being built and why;
+          (2) a numbered list of concrete, checkable acceptance criteria — each one a thing a
+          reviewer can verify by reading a file, not a vague quality goal;
+          (3) the exact list of output files the builder must produce, with paths relative to
+          this directory;
+          (4) explicit NON-goals and constraints, including: no network calls, no new
+          dependencies, no secrets, no writing outside this directory.
+          Keep SPEC.md under 150 lines. Write only SPEC.md. Do not implement the task."
+
+          After the tool returns, reply with ONE short sentence saying whether ok was true
+          and naming the files it created. Do not write any plan yourself.
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: claude_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Delegates spec-writing to Claude, which writes SPEC.md into the workspace.'
+      context_window: 4
+      log_output: true
+
+    # --- Builder: Kimi implements against the spec. Kimi is the guest builder — strongest on
+    # design/build arcs. It reads SPEC.md itself rather than being handed the brief through
+    # graph context, which keeps this node's own synthesis burden near zero.
+    - id: Builder
+      type: agent
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        role: |-
+          You are the Builder node. You do NOT write any code yourself. You delegate the
+          build to Kimi, the guest builder, with ONE call to the `kimi_run` tool.
+
+          Set `expect_files` to true.
+          Set `timeout_seconds` to 900.
+          Set `task` to exactly this text, copied verbatim — do not add the user's task, do
+          not summarise, do not paste file contents:
+
+          "Read SPEC.md in the current working directory — it is the complete brief for this
+          job. Implement it exactly, writing every output file SPEC.md names into this same
+          directory. Obey SPEC.md's non-goals and constraints without exception: no network
+          calls, no new dependencies, no secrets, and write nothing outside this directory.
+          When you are done, write BUILD_NOTES.md: one short paragraph on what you built,
+          plus an explicit line for each acceptance criterion in SPEC.md saying how you met
+          it, or saying plainly that you did not. Do not overstate what you did — an honest
+          'not done' is worth more here than a confident claim that fails review."
+
+          After the tool returns, reply with ONE short sentence: whether ok was true, and the
+          list of files it created or modified. If ok was false, say so plainly and quote the
+          error — do not pretend the build succeeded.
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: kimi_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Delegates the build to Kimi (curated skills pinned, external service).'
+      context_window: 4
+      log_output: true
+
+    # --- Reviewer: Claude judges the build against the spec. A separate crew member from the
+    # builder, on purpose — self-review by the thing that just built it is not review.
+    - id: Reviewer
+      type: agent
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        role: |-
+          You are the Reviewer node. You do NOT review anything yourself — you delegate the
+          judgement to Claude with ONE call to the `claude_run` tool.
+
+          Set `expect_files` to true.
+          Set `timeout_seconds` to 420.
+          Set `task` to exactly this text, copied verbatim:
+
+          "Review the work in the current working directory. Read SPEC.md for the acceptance
+          criteria, then read every output file it names, plus BUILD_NOTES.md. For EACH
+          numbered acceptance criterion, verify it yourself against the actual file contents
+          — do not take BUILD_NOTES.md's word for anything. Write REVIEW.md containing a
+          per-criterion PASS or FAIL with the specific evidence you checked, then a final
+          line that is exactly 'VERDICT: APPROVE' if every criterion passes, or exactly
+          'VERDICT: NEEDS_WORK' if any fails. Be strict: a criterion you could not verify is
+          a FAIL, not a pass. End your own reply with that same VERDICT line."
+
+          After the tool returns, reply with the verdict. Your last line must be exactly
+          'VERDICT: APPROVE' or 'VERDICT: NEEDS_WORK', copied from Claude's answer. That line
+          is the routing keyword — nothing else may appear after it.
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: claude_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Delegates review to Claude; emits the APPROVE / NEEDS_WORK routing keyword.'
+      context_window: 6
+      log_output: true
+
+    # --- Bounded repair. Each crew hop is a real subprocess costing real wall-clock (Kimi is
+    # network-bound, up to 900s), so this cap is deliberately low — 2, not ChatDev_v1's 3-5,
+    # which bound cheap single-LLM iterations rather than subprocess fan-out.
+    - id: Repair_Loop_Counter
+      type: loop_counter
+      description: Caps the Builder/Reviewer repair cycle at 2 attempts.
+      context_window: 0
+      config:
+        max_iterations: 2
+        reset_on_emit: true
+        message: 'Repair cap reached (2 attempts) — sending the last attempt to Pac as-is, flagged as NOT review-clean, rather than burning more crew calls.'
+
+    # --- THE GATE. Pac rules before anything is packaged. This is the node the whole console
+    # exists for: the crew works where he can watch, and stops where he decides.
+    - id: Pac_Approval
+      type: human
+      description: "Pac's approval gate — the human in the loop before packaging."
+      context_window: 0
+      config:
+        description: |-
+          CREW RUN COMPLETE — your call, Captain.
+
+          Everything above happened in this run's code_workspace/ only. Nothing has touched a
+          fleet repo, and nothing has been published.
+
+          Read REVIEW.md (and BUILD_NOTES.md) in the workspace, then reply with one of:
+            APPROVE  — package it to the outbox for the gold-in-gold-out gate
+            REJECT   — bin it; say why so it lands in the notes
+          or any free-text notes you want carried into the packaging step.
+
+          Remember: this output is UNTRUSTED generated code until the gate clears it.
+
+    - id: Package
+      type: literal
+      description: Terminal — Pac has ruled; the run is closed out.
+      context_window: 0
+      config:
+        role: assistant
+        content: |-
+          Crew run closed. The workspace (code_workspace/) holds SPEC.md, the build output,
+          BUILD_NOTES.md and REVIEW.md, plus every crew member's full session stream under
+          _agent_logs/ for forensics.
+
+          Next step is Number One's: move the approved artifacts to the outbox and run the
+          gold-in-gold-out gate. Nothing here is trusted or merged until that passes.
+
+  edges:
+    - from: Intake
+      to: Planner
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Planner
+      to: Builder
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Builder
+      to: Reviewer
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    # Clean review -> straight to Pac.
+    - from: Reviewer
+      to: Pac_Approval
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: APPROVE'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    # Failed review -> back to the Builder for one more pass...
+    - from: Reviewer
+      to: Builder
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: NEEDS_WORK'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    # ...and the counter bounds how many times that can happen.
+    - from: Reviewer
+      to: Repair_Loop_Counter
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: NEEDS_WORK'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    # Cap hit: Pac still gets the call, just with the work flagged as not review-clean.
+    - from: Repair_Loop_Counter
+      to: Pac_Approval
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Pac_Approval
+      to: Package
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+  start:
+    - Intake
+  end:
+    - Package
+version: 1.0.0
+vars: {}

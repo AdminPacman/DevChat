@@ -19,7 +19,13 @@ frontend/.vscode/
 .DS_Store
 
 # Environment
+# Glob, not just `.env` — a bare `.env` rule does NOT cover `.env.bak-*`, `.env.local`, or
+# any editor/script backup, and those hold the same live credentials. A timestamped
+# `.env.bak-*` written during routine maintenance came back committable on 0018.05.26 a₿;
+# caught and shredded before the commit, but this rule is what stops the next one.
 .env
+.env.*
+!.env.example
 
 # Project Specific
 logs/

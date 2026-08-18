@@ -1,0 +1,361 @@
+graph:
+  id: bb_showcard_v2
+  description: >-
+    TASK-01 (/bb SHOW CARD slice) — small, focused graph: deterministic workspace seed (copies
+    the real reference files, no LLM) -> Coder (Pi subprocess "hands", per
+    ~/dev/skills/pi/SKILL.md's seam) -> QA_Verifier (DevChat's own file tools) -> bounded
+    refinement loop (loop_counter, per Job 2's house pattern) -> terminal. Adapted from
+    demo_code.yaml's "spec blesses, python executes" precedent for the seed step and
+    GameDev_with_manager.yaml's build->QA->bounded-repair shape for the rest, per the
+    devchat-templates-survey.md recommendation to keep this small and focused rather than
+    reuse a big template wholesale.
+
+    v2 (0018.05.26 a₿) — SAME GRAPH SHAPE AS v1, HOSTED MODELS INSTEAD OF LOCAL. v1 is kept
+    as the local-only reference; use it only for cheap smoke runs.
+
+    Why v2 exists, from the v1 post-mortem: a local 4B cannot do this job at any context
+    size we can fit on this box. The task requires holding ~40 KB of reference source
+    (TASK_SPEC + BuddyDevice.tsx + bft.ts) AND then emitting a ~16 KB file — comfortably over
+    16384 tokens before generation even starts. At 4096 the model lost its instruction
+    entirely; at 16384 it read all three files and produced a complete, plausible
+    implementation but then PRINTED it as chat instead of calling `write`, so `output/`
+    stayed empty. Right task, right code, wrong action.
+
+    So v2 moves both the choreography nodes and Pi's own model onto NVIDIA NIM (real 128k
+    windows, verified tool-calling). Pi picks the credential up from NVIDIA_API_KEY in the
+    environment — it is NOT duplicated into ~/.pi/agent/models.json. Pi's timeout is raised
+    to 600s because generating a full file is a longer job than v1's 280s allowed.
+  log_level: INFO
+  is_majority_voting: false
+  nodes:
+    - id: Seed_Script
+      type: literal
+      description: Fixed Python source (no LLM) that seeds the run workspace with reference files + the task spec.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import os
+          import shutil
+          from pathlib import Path
+
+          SRC = Path("/home/pac/dev/onecocreation/src")
+          FILES = [
+              ("components/bb/BuddyDevice.tsx", "reference/BuddyDevice.tsx"),
+              ("lib/bb/bft.ts", "reference/bft.ts"),
+              ("components/bb/BftDate.tsx", "reference/BftDate.tsx"),
+              ("lib/bb/types.ts", "reference/types.ts"),
+              ("lib/bb/store.ts", "reference/store.ts"),
+          ]
+
+          os.makedirs("reference", exist_ok=True)
+          os.makedirs("output", exist_ok=True)
+
+          copied = []
+          missing = []
+          for rel_src, rel_dst in FILES:
+              src_path = SRC / rel_src
+              if src_path.is_file():
+                  shutil.copy(src_path, rel_dst)
+                  copied.append(rel_dst)
+              else:
+                  missing.append(rel_src)
+
+          TASK_SPEC_TEXT = '''# TASK-01 -- /bb SHOW CARD slice (condensed, see reference/ for the real files)
+
+          Repo: onecocreation. Target: reference/BuddyDevice.tsx (a working, live component -- do
+          not treat it as a stub). Do not touch reference/bft.ts's math, reference files are
+          READ-ONLY -- write your result into output/, never edit anything under reference/.
+
+          ## The gap to close
+          reference/bft.ts exports `deriveTraits(bornBlock: number, name: string): BuddyTraits`
+          -- fully implemented, deterministic, pure function of bornBlock/name. It is called
+          NOWHERE in the app today. Read its real signature and the BuddyTraits shape directly
+          out of reference/bft.ts (search for "deriveTraits" and "BuddyTraits") -- do not guess
+          field names.
+
+          ## What to build
+          Add a flip/expand SHOW CARD to BuddyDevice.tsx (inline, or split into a new
+          ShowCard.tsx component that BuddyDevice.tsx renders -- your call) that:
+          1. Is reachable from a small, unobtrusive, keyboard-accessible control (a real
+             <button> with an aria-label, not a bare div onClick) near the buddy's name --
+             exact placement is your call.
+          2. Shows, when open: stage (reference/BuddyDevice.tsx already computes this via
+             stageForAgeDays -- reuse it), age (already computed -- reuse it), traits (call
+             deriveTraits(buddy.bornBlock, buddy.name) -- this is the actual new wiring), and
+             born-block lore (the existing <BftDate height={buddy.bornBlock} /> component from
+             reference/BftDate.tsx, plus the raw block height, presented as a short lore line).
+          3. May move the existing inline "Stage . Age . Born . Animal" badge row behind the
+             flip if it becomes redundant with the new card -- but the hunger/happy/energy
+             meters and the care-action buttons MUST stay exactly where they are. Do not touch
+             the core interaction loop, the canvas scene renderer, the BFT calendar math, the
+             care/decay loop in engine.ts, or the Hatchery/hatch flow.
+          4. Is pure client-side render off data already in memory (buddy, currentBlock). No new
+             network calls, no new nostr events, no new npm dependencies, no new external CDN
+             references, no new localStorage keys, no eval.
+          5. Degrades to an instant show/hide under prefers-reduced-motion if the flip is
+             animated (reference/BuddyDevice.tsx already uses
+             window.matchMedia("(prefers-reduced-motion: reduce)") elsewhere -- match that
+             pattern).
+          6. TypeScript, matches reference/BuddyDevice.tsx's existing conventions: typed props,
+             "use client" where needed, Tailwind utility classes, the existing color token
+             pattern (see the C color const and border-edge / bg-panel / font-pixel / font-mono
+             classes already in the file).
+
+          ## Deliverable (write into output/, this workspace)
+          - output/BuddyDevice.tsx -- the complete modified file (full file, not a diff
+            fragment), OR output/BuddyDevice.tsx (with the new integration wiring) plus
+            output/ShowCard.tsx if you split the card into its own component.
+          - output/NOTES.md -- one paragraph: what BuddyTraits fields you actually used (the
+            real shape from bft.ts, not invented ones), how the flip is triggered, and any
+            assumption you made where this spec left a call open (e.g. exact icon/placement).
+          '''
+
+          Path("TASK_SPEC.md").write_text(TASK_SPEC_TEXT, encoding="utf-8")
+
+          print("SEED OK")
+          print("copied:", copied)
+          print("missing:", missing)
+          ```
+    - id: Seed_Executor
+      type: python
+      description: Runs Seed_Script's code verbatim -- deterministic, no LLM involved in seeding the workspace.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 30
+        encoding: utf-8
+    # --- Coder: Pi as this node's "hands", per ~/dev/skills/pi/SKILL.md's recommended seam
+    # (Job 1, devchat build agent 0018.05.25 a₿). DevChat stays the choreographer -- this agent's
+    # only job is to make ONE tool call handing the pre-seeded, already-written task text to Pi;
+    # Pi does its own reading of TASK_SPEC.md + reference/ inside the workspace (Read is one of
+    # Pi's 4 built-in tools) and does the actual file edit with its own mature Edit/Write loop.
+    # Keeping the Coder's own synthesis burden to "copy this exact string into a tool call" is a
+    # deliberate small-model risk mitigation -- qwen3:4b is proven for tool-calling but not for
+    # regurgitating long text reliably (see ~/dev/skills/devchat/SKILL.md's model table).
+    - id: Coder
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        role: |-
+          You are the Coder node in a DevChat build graph. A workspace has already been seeded
+          (by a deterministic script, not you) with:
+          - TASK_SPEC.md -- the full task requirements
+          - reference/BuddyDevice.tsx, reference/bft.ts, reference/BftDate.tsx,
+            reference/types.ts, reference/store.ts -- the real existing source files
+          - an empty output/ directory where the finished result belongs
+
+          You have exactly one job: call the `pi_run` tool to delegate the actual file-reading
+          and file-editing work to Pi, a coding-agent subprocess that can read and write files
+          in this same workspace. Call it with these EXACT arguments -- do not shorten, alter,
+          or summarize the task string, copy it verbatim:
+
+          model: "nvidia/nemotron-3-super-120b-a12b"
+          provider: "nvidia"
+          timeout_seconds: 600
+          task: "Read TASK_SPEC.md in this workspace directory for the full requirements. Read every file in reference/ (BuddyDevice.tsx, bft.ts, BftDate.tsx, types.ts, store.ts) for the exact existing code -- these are read-only references, never edit anything under reference/. Implement the SHOW CARD slice exactly as TASK_SPEC.md describes. Write your result into output/: output/BuddyDevice.tsx as the complete modified file (and output/ShowCard.tsx too if you split the card into its own component), plus output/NOTES.md with the one-paragraph note TASK_SPEC.md asks for. Do not add network calls, eval, new dependencies, new localStorage keys, or external CDN references."
+
+          After the tool call returns, report in one short paragraph whether it succeeded
+          (ok: true/false) and, if it failed, what the error was. Do not attempt to write the
+          code yourself -- your only role is the delegation call.
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: pi_run
+        thinking: null
+        memories: []
+        retry: null
+      description: ''
+      context_window: 4
+      log_output: true
+    - id: QA_Verifier
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        role: |-
+          You are QA_Verifier. Check the Coder's work using your file tools, scoped to this
+          same run workspace.
+
+          CHECKLIST (use describe_available_files to see what exists, read_text_file_snippet to
+          read contents):
+          A. output/BuddyDevice.tsx (or output/BuddyDevice.tsx + output/ShowCard.tsx) exists and
+             is non-empty.
+          B. The output somewhere calls deriveTraits( -- grep the text you read for that exact
+             substring.
+          C. The output references stage, age, and bornBlock (or BftDate) -- the three other
+             SHOW CARD facts required.
+          D. There is a real <button> (or other real interactive element) with an
+             aria-label or visible accessible text for the flip control -- not a bare
+             `<div onClick`.
+          E. output/NOTES.md exists and is non-empty.
+          F. No occurrences of: fetch(, XMLHttpRequest, eval(, http://, https:// (other than
+             inside comments quoting the spec itself), new nostr event/signEvent calls, or
+             new localStorage. keys beyond what's already read from the reference files.
+
+          DECISION LOGIC: A, B, C, D, E, F must ALL pass to approve.
+
+          OUTPUT FORMAT:
+          Analysis: <brief findings per item>
+
+          [If all pass]
+          Decision: APPROVE
+
+          [If any fail]
+          Decision: NEEDS_REFINEMENT
+          Issues:
+          1. ...
+
+          Your last line must contain either "APPROVE" or "NEEDS_REFINEMENT" as the routing
+          keyword.
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: read_text_file_snippet
+                - name: describe_available_files
+        thinking: null
+        memories: []
+        retry: null
+      description: ''
+      context_window: 6
+      log_output: true
+    # --- house pattern from Job 2 (loop_counter bounding): cap Coder<->QA_Verifier retries so a
+    # local small model that can't converge doesn't grind an unattended overnight run. Pi calls
+    # cost real wall-clock time (up to 280s each per the Coder's timeout above), so this cap is
+    # intentionally low (2) -- ChatDev_v1.yaml's comparable repair loops use 3-5, but those are
+    # cheap single-LLM-call iterations, not a subprocess-spawning tool call.
+    - id: Refine_Loop_Counter
+      type: loop_counter
+      description: Caps the Coder/QA_Verifier refinement cycle at 2 attempts.
+      context_window: 0
+      config:
+        max_iterations: 2
+        reset_on_emit: true
+        message: 'Refinement cap reached (2 attempts) -- releasing output/ as-is for human review rather than grinding further Pi calls.'
+    - id: Build_Passed
+      type: literal
+      description: Terminal node -- QA approved.
+      context_window: 0
+      config:
+        content: 'SHOW CARD build passed automated QA. See output/BuddyDevice.tsx (+ output/ShowCard.tsx if present) and output/NOTES.md in this run''s code_workspace/.'
+        role: assistant
+    - id: Build_Capped
+      type: literal
+      description: Terminal node -- refinement cap hit, needs human review.
+      context_window: 0
+      config:
+        content: 'SHOW CARD build did not reach APPROVE within 2 refinement passes. output/ contains the last attempt -- Number One must review by hand before this goes to outbox/bb-showcard/.'
+        role: assistant
+  edges:
+    - from: Seed_Script
+      to: Seed_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Seed_Executor
+      to: Coder
+      trigger: true
+      condition: 'true'
+      carry_data: false
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Coder
+      to: QA_Verifier
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: QA_Verifier
+      to: Build_Passed
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - APPROVE
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: QA_Verifier
+      to: Coder
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - NEEDS_REFINEMENT
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: QA_Verifier
+      to: Refine_Loop_Counter
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - NEEDS_REFINEMENT
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Refine_Loop_Counter
+      to: Build_Capped
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+  start:
+    - Seed_Script
+  end:
+    - Build_Passed
+    - Build_Capped
+version: 1.0.0
+vars: {}

@@ -1,0 +1,101 @@
+graph:
+  id: nvidia_smoke_test
+  description: >-
+    NVIDIA NIM smoke test — AND the house worked example of how a secret enters a DevChat
+    graph.
+
+    Look at the `api_key` field on the node below: it holds a dollar-brace NAME, not a value.
+    That is the whole pattern. The real key lives only in `.env` (gitignored, untracked, chmod
+    600) and is substituted at graph-load time by `utils/env_loader.py` +
+    `utils/vars_resolver.py`. This file is therefore safe to commit, safe to paste into a
+    review, and safe to hand to another agent — it contains no secret.
+
+    🔴 SHARP EDGE, learned the hard way writing this very file: placeholder substitution runs
+    over EVERY string in the YAML — descriptions, literal node content, agent role text, all
+    of it. Not just config fields. So writing a secret's placeholder name into PROSE (as
+    documentation, in a comment-like description, in a terminal node's message) does not
+    document it — it INTERPOLATES THE REAL SECRET into that text, and from there into the run
+    output and the WareHouse artifacts. Never write a secret's placeholder into any string
+    you intend a human to read. Refer to it in words, as this paragraph does.
+    (A missing name is at least loud: an unknown placeholder aborts the run with
+    "Unresolved placeholder", which is how this edge got found.)
+
+    Rules that go with it:
+      * NEVER paste a key inline into a YAML, a task_prompt, a skill file, or an agent's
+        role text. If you find yourself typing a key into any of those, stop — the answer is
+        always a placeholder reference in a CONFIG field plus a line in .env.
+      * The crew tools (`kimi_run`, `claude_run`) hard-refuse secret-shaped input before they
+        spawn anything, because a prompt is the easiest place to leak one by accident.
+      * Verified 0018.05.26: resolved key values are NOT persisted into WareHouse run
+        artifacts — no `api_key` field appears in workflow_summary.yaml, node_outputs.yaml,
+        execution_logs.json or token_usage.json. That holds only as long as nobody writes a
+        secret placeholder into a prose field, per the sharp edge above.
+
+    Run it from the console with any short task_prompt (e.g. "say hello"). If the key is
+    missing or wrong the run fails at the provider call with an auth error — that failure IS
+    the test result.
+  log_level: INFO
+  is_majority_voting: false
+  nodes:
+    - id: NVIDIA_Probe
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        # ── THE POINT OF THIS FILE ────────────────────────────────────────────────────────
+        # A name, never a value. Same for base_url so the endpoint is configurable too.
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        # ──────────────────────────────────────────────────────────────────────────────────
+        role: |-
+          You are a connectivity probe for the Pac's Arcade fleet. Answer the user's message
+          in at most two sentences, then on a final separate line state exactly which model
+          you are, in the form:
+
+          MODEL: <your model name>
+
+          Do not use any tools. Do not write any files. Keep it short — this run exists to
+          prove the credential and endpoint work, nothing more.
+        params:
+          temperature: 0.2
+          max_tokens: 300
+        tooling: []
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Single hosted-model call — proves the NVIDIA key + endpoint resolve and work.'
+      context_window: 2
+      log_output: true
+
+    - id: Probe_Done
+      type: literal
+      description: Terminal.
+      context_window: 0
+      config:
+        role: assistant
+        # NOTE: deliberately no placeholder names in this text — see the sharp edge in the
+        # graph description. Interpolation would put the live key in the run output.
+        content: >-
+          NVIDIA NIM probe complete. If the node above answered, the key in .env resolved
+          correctly and hosted models are available to any graph whose node config points at
+          the NVIDIA base-url, api-key and model-name entries in .env. Hosted models carry
+          their REAL context window (unlike local Ollama's 4096 default), which makes them
+          the right choice for any node that must read actual source files.
+
+  edges:
+    - from: NVIDIA_Probe
+      to: Probe_Done
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+  start:
+    - NVIDIA_Probe
+  end:
+    - Probe_Done
+version: 1.0.0
+vars: {}
