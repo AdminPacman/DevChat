@@ -1,0 +1,465 @@
+graph:
+  id: kimi_blocker_fix
+  description: >-
+    TASK-03 swarm blocker fixes — dispatching the EXISTING brief
+    (~/dev/kimi/inbox/TASK-03-swarm-gate-blockers.md) to Kimi through the crew console, so
+    the work happens where Pac can watch it and rule on it.
+
+    Route: Seed (deterministic clone + 25-patch stack, no LLM) -> Kimi fixes the 3 blockers
+    -> deterministic patch generation -> Claude gates it (tsc + eslint + per-blocker
+    verification) -> bounded repair -> PAC'S APPROVAL (human) -> package instructions.
+
+    ⚠️ LAUNCH FROM THE CONSOLE (http://localhost:5173). `type: human` blocks properly only in
+    live web-UI/WebSocket runs.
+
+    WHY A CLONE, NOT THE REAL TREE: the standing rule is ONE DELIVERABLE OWNS THE WORKING
+    TREE. `~/dev/onecocreation` currently holds 126 uncommitted files (the swarm work), and a
+    gate's verdict against a moving tree is worthless — that is what cost the last round. So
+    this graph never touches the real repo. It builds its own pristine `--shared` clone at
+    59a5dbd, replays the 25 reviewed patches onto it, and delivers patch #26 as a file. The
+    clone shares git objects with the parent (cheap, ~35 MB of .git) and symlinks
+    node_modules (692 MB, never copied) so `tsc` can actually run.
+
+    VERIFIED BEFORE THIS GRAPH WAS WRITTEN (0018.05.26 a₿): all 25 patches apply clean on
+    pristine 59a5dbd producing exactly 126 changed files — matching the working tree — and
+    all three blockers are present in the stacked result at the lines the brief names.
+  log_level: INFO
+  is_majority_voting: false
+  nodes:
+
+    # ── 1. SEED — deterministic, no LLM. Clone, stack, brief. ────────────────────────────
+    - id: Seed_Script
+      type: literal
+      description: Fixed Python that builds the stacked clone and stages the brief. No model involved.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import os, shutil, subprocess, sys
+          from pathlib import Path
+
+          SRC       = Path("/home/pac/dev/onecocreation")
+          OUTBOX    = Path("/home/pac/dev/kimi/outbox")
+          BRIEF     = Path("/home/pac/dev/kimi/inbox/TASK-03-swarm-gate-blockers.md")
+          BASE      = "59a5dbd"
+          STACKS    = ["task-03-p1", "task-03-p2", "task-03-time", "task-03-swarm"]
+          REPO      = Path("repo")
+
+          def run(args, cwd=None, check=True):
+              r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+              if check and r.returncode != 0:
+                  print("CMD FAILED:", " ".join(args)); print(r.stderr[:600]); sys.exit(1)
+              return r
+
+          if REPO.exists():
+              shutil.rmtree(REPO)
+
+          # --shared: reuse the parent's git objects instead of copying them.
+          run(["git", "clone", "--shared", "--quiet", str(SRC), str(REPO)])
+          run(["git", "checkout", "--quiet", BASE], cwd=REPO)
+
+          dirty = run(["git", "status", "--porcelain"], cwd=REPO).stdout.strip()
+          print("clone at", BASE, "- pristine:" , "yes" if not dirty else "NO (unexpected)")
+
+          # node_modules is 692 MB. Symlink it so tsc/eslint work without copying.
+          link = REPO / "node_modules"
+          if not link.exists():
+              os.symlink(SRC / "node_modules", link)
+          print("node_modules symlinked:", link.is_dir())
+
+          applied, failed = [], []
+          for stack in STACKS:
+              for patch in sorted((OUTBOX / stack).glob("*.patch")):
+                  r = run(["git", "apply", "--whitespace=nowarn", str(patch)],
+                          cwd=REPO, check=False)
+                  (applied if r.returncode == 0 else failed).append(f"{stack}/{patch.name}")
+                  if r.returncode != 0:
+                      print("PATCH FAILED:", stack, patch.name, r.stderr[:200])
+
+          print(f"patches applied: {len(applied)}  failed: {len(failed)}")
+          changed = run(["git", "status", "--porcelain"], cwd=REPO).stdout.strip().splitlines()
+          print("changed files:", len(changed), "(expected 126)")
+
+          # Record the exact pre-fix state so patch generation later is a clean diff.
+          run(["git", "add", "-A"], cwd=REPO)
+          run(["git", "-c", "user.email=crew@pacsarcade", "-c", "user.name=Crew Console",
+               "commit", "--quiet", "-m", "stacked: 25 reviewed patches (pre-blocker-fix baseline)"],
+              cwd=REPO)
+          head = run(["git", "rev-parse", "HEAD"], cwd=REPO).stdout.strip()
+          Path("BASELINE_SHA").write_text(head, encoding="utf-8")
+          print("baseline commit:", head[:12])
+
+          shutil.copy(BRIEF, "TASK.md")
+          print("brief staged: TASK.md", Path("TASK.md").stat().st_size, "bytes")
+
+          if failed:
+              print("SEED FAILED - do not proceed")
+              sys.exit(1)
+          print("SEED OK")
+          ```
+
+    - id: Seed_Executor
+      type: python
+      description: Runs Seed_Script verbatim. Deterministic; a non-zero exit means the stack drifted.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 300
+        encoding: utf-8
+
+    # ── 2. BUILDER — Kimi fixes the blockers. It reads TASK.md itself. ───────────────────
+    - id: Builder
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        role: |-
+          You are the Builder node. You do NOT edit any code yourself. You delegate the whole
+          job to Kimi with exactly ONE call to the `kimi_run` tool.
+
+          Set `expect_files` to true.
+          Set `timeout_seconds` to 1500.
+          Set `task` to exactly this text, copied verbatim — do not summarise or shorten it:
+
+          "Read TASK.md in the current working directory. It is a gate report listing three
+          BLOCKERS and four should-fix items in a Next.js/TypeScript repo that has been cloned
+          into ./repo with 25 reviewed patches already applied. Work ONLY inside ./repo.
+          Fix all three blockers exactly as TASK.md specifies. In short: (1) in
+          src/components/rooms/RoomsShelf.tsx the group accents were changed to var() values
+          but lines 151/152/158 append hex-alpha to them, which yields invalid CSS and drops
+          the whole declaration — fix it so the pill border, background and divider render
+          again, and make the four accent rows consistent with each other; (2)
+          src/lib/cart-reminders.ts and src/lib/gift-vouchers.ts each contain a JSX-style
+          comment inside an HTML template literal, which ships as visible text in a customer
+          email — delete those, then grep every template literal under src/lib for the same
+          pattern to be sure none remain; (3) src/app/cartridge.css line ~236 gives
+          #classes .lockpill a theme-aware token on a card whose background is pinned in both
+          themes, destroying contrast — restore a pinned value. Then do items 4-7 from TASK.md
+          if they are quick, and state plainly which you did and which you skipped. Do not fix
+          anything TASK.md's 'Cleared' section says is already fine. Do not reformat files, do
+          not make unrelated edits, and change as few lines as possible. When done, write
+          FIX_NOTES.md in the PARENT directory (not inside repo/) describing, per blocker,
+          exactly what you changed and why, plus your answer on item 5's gold-law question."
+
+          After the tool returns, reply in one short sentence: whether ok was true, and the
+          files it changed. If ok was false, say so plainly and quote the error — never claim
+          success the tool did not report.
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: kimi_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Delegates the blocker fixes to Kimi (curated skills pinned, external service).'
+      context_window: 4
+      log_output: true
+
+    # ── 3. PATCH — deterministic. Kimi's edits become patch #26. ─────────────────────────
+    - id: Patch_Script
+      type: literal
+      description: Fixed Python that turns Kimi's edits into the deliverable patch. No LLM.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import subprocess, sys
+          from pathlib import Path
+
+          REPO = Path("repo")
+          OUT  = Path("11-swarm-blocker-fixes.patch")
+
+          def run(args, cwd=None):
+              return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+
+          status = run(["git", "status", "--porcelain"], cwd=REPO).stdout.strip()
+          if not status:
+              print("NO CHANGES - Kimi did not edit anything in repo/. Nothing to package.")
+              sys.exit(1)
+
+          print("files Kimi touched:")
+          for line in status.splitlines():
+              print("  ", line)
+
+          diff = run(["git", "diff", "--patch"], cwd=REPO).stdout
+          untracked = run(["git", "ls-files", "--others", "--exclude-standard"], cwd=REPO).stdout.split()
+          if untracked:
+              print("NOTE untracked files (not in diff):", untracked)
+
+          OUT.write_text(diff, encoding="utf-8")
+          print("wrote", OUT, OUT.stat().st_size, "bytes")
+
+          # Prove the patch is self-consistent: it must re-apply on the baseline.
+          check = run(["git", "stash", "--include-untracked"], cwd=REPO)
+          reapply = run(["git", "apply", "--check", str(Path("..") / OUT)], cwd=REPO)
+          run(["git", "stash", "pop"], cwd=REPO)
+          print("patch re-applies on baseline:", "YES" if reapply.returncode == 0 else "NO " + reapply.stderr[:200])
+          print("PATCH OK")
+          ```
+
+    - id: Patch_Executor
+      type: python
+      description: Runs Patch_Script. Exits non-zero if Kimi changed nothing.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 180
+        encoding: utf-8
+
+    # ── 4. GATE — Claude verifies. Needs Bash: this is the step that compiles. ───────────
+    - id: Gate
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        role: |-
+          You are the Gate node. You do NOT judge the work yourself — you delegate the review
+          to Claude with exactly ONE call to the `claude_run` tool.
+
+          Set `expect_files` to true.
+          Set `timeout_seconds` to 900.
+          Set `allowed_tools` to "Read,Write,Edit,Grep,Glob,Bash".
+          Set `task` to exactly this text, copied verbatim:
+
+          "You are gating a fix for three blockers. Read TASK.md (the original gate report)
+          and FIX_NOTES.md (the builder's account) in the current directory. The edited repo
+          is ./repo and the generated patch is ./11-swarm-blocker-fixes.patch.
+
+          Verify each blocker YOURSELF against the actual file contents — never trust
+          FIX_NOTES.md:
+          B1: src/components/rooms/RoomsShelf.tsx must no longer append hex-alpha directly to
+              a var() value. Confirm the border, background and divider now produce valid CSS,
+              and that the four accent rows are internally consistent.
+          B2: grep -rn '{/\\*' src/lib must return nothing inside template literals; check
+              cart-reminders.ts and gift-vouchers.ts specifically.
+          B3: src/app/cartridge.css's #classes .lockpill colour must be a pinned value, not a
+              theme-aware token.
+
+          Then run, from inside ./repo:
+            npx --no-install tsc --noEmit
+            npx --no-install eslint . 2>&1 | tail -20
+          Report tsc's result exactly — on the pre-fix stacked tree tsc exits 0 with no
+          errors, so ANY tsc error is a regression the builder introduced. For eslint, the
+          MEASURED baseline on that same pre-fix tree is 65 errors / 9 warnings (verified
+          0018.05.26; note the earlier brief said 65/10 — 9 is the real number). Report the
+          DELTA against 65/9, not the absolute count. A delta of zero is a pass.
+
+          Also confirm the builder made no unrelated or cosmetic edits: read the patch and
+          flag any hunk that is not clearly one of B1/B2/B3 or a stated should-fix item.
+
+          Write REVIEW.md with a per-blocker PASS/FAIL plus the evidence you actually checked,
+          the tsc and eslint results, and a list of any out-of-scope hunks. End REVIEW.md with
+          a line that is exactly 'VERDICT: APPROVE' if all three blockers pass, tsc is clean
+          and there are no out-of-scope edits, or exactly 'VERDICT: NEEDS_WORK' otherwise. A
+          thing you could not verify is a FAIL. End your own reply with that same VERDICT line."
+
+          After the tool returns, reply with Claude's findings in two or three sentences. Your
+          final line must be exactly 'VERDICT: APPROVE' or 'VERDICT: NEEDS_WORK' and nothing
+          may follow it — that line is the routing keyword.
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: claude_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Claude compiles and verifies each blocker; emits the routing verdict.'
+      context_window: 6
+      log_output: true
+
+    - id: Repair_Loop_Counter
+      type: loop_counter
+      description: Caps the Builder/Gate repair cycle at 2. Each hop is a real subprocess.
+      context_window: 0
+      config:
+        max_iterations: 2
+        reset_on_emit: true
+        message: 'Repair cap reached (2 attempts) — sending to Pac flagged as NOT gate-clean rather than burning more crew calls.'
+
+    # ── 5. PAC RULES ────────────────────────────────────────────────────────────────────
+    - id: Pac_Approval
+      type: human
+      description: "Pac's approval gate before the patch is packaged for the outbox."
+      context_window: 0
+      config:
+        description: |-
+          BLOCKER FIX READY — your call, Captain.
+
+          Nothing has touched ~/dev/onecocreation. All of this happened in this run's own
+          clone; your 126-file working tree is exactly as you left it.
+
+          In the run workspace: REVIEW.md (Claude's gate), FIX_NOTES.md (Kimi's account),
+          11-swarm-blocker-fixes.patch (the deliverable), and repo/ (the stacked tree with
+          the fixes applied) — plus every crew member's full session stream in _agent_logs/.
+
+          Reply with:
+            APPROVE — package the patch to ~/dev/kimi/outbox/task-03-swarm/ as #26
+            REJECT  — bin it; say why so it lands in the notes
+          or any notes you want carried into packaging.
+
+          Item 5 of the brief needs YOUR ruling either way: `--warn`'s night face is
+          byte-identical to `--gold-2`, so surfaces routed to `--warn` paint exact money-gold
+          while looking innocent in review. Retune the token, or move those surfaces off it?
+
+    - id: Package
+      type: literal
+      description: Terminal — Pac has ruled.
+      context_window: 0
+      config:
+        role: assistant
+        content: |-
+          Crew run closed. The deliverable is 11-swarm-blocker-fixes.patch in this run's
+          code_workspace/, alongside REVIEW.md and FIX_NOTES.md.
+
+          On APPROVE, the patch becomes #26 of the stack and the whole 26-patch stack is
+          clear to commit onto pristine 59a5dbd on booking-s6. Copy it to
+          ~/dev/kimi/outbox/task-03-swarm/ and archive the brief out of the inbox.
+
+          This graph deliberately does NOT write into ~/dev/kimi or ~/dev/onecocreation
+          itself — packaging stays a human-initiated step so nothing lands in a fleet
+          directory without Pac's hand on it.
+
+  edges:
+    - from: Seed_Script
+      to: Seed_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Seed_Executor
+      to: Builder
+      trigger: true
+      condition: 'true'
+      carry_data: false
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Builder
+      to: Patch_Script
+      trigger: true
+      condition: 'true'
+      carry_data: false
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Patch_Script
+      to: Patch_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Patch_Executor
+      to: Gate
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Gate
+      to: Pac_Approval
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: APPROVE'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Gate
+      to: Builder
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: NEEDS_WORK'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Gate
+      to: Repair_Loop_Counter
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: NEEDS_WORK'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Repair_Loop_Counter
+      to: Pac_Approval
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Pac_Approval
+      to: Package
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+  start:
+    - Seed_Script
+  end:
+    - Package
+version: 1.0.0
+vars: {}
