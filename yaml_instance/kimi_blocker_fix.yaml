@@ -93,6 +93,99 @@ graph:
           shutil.copy(BRIEF, "TASK.md")
           print("brief staged: TASK.md", Path("TASK.md").stat().st_size, "bytes")
 
+          # ── Instructions go ON DISK, not through a model. ──────────────────────────────
+          # Learned 0018.05.26: a delegating node's ONLY job must be a tiny tool call. When
+          # the long instruction lived in the node's role text, the 30B choreography model
+          # (a) paraphrased it — Claude was told "read these files" instead of
+          # "verify and write REVIEW.md", so it analysed correctly and wrote nothing — and
+          # (b) saw the shell commands described in that text and tried to call `bash` and
+          # `read` ITSELF, tools that node does not have, spraying "Tool call bash for node
+          # Gate" errors and looping 5 times at ~$0.45 a pass. Text a model must relay is
+          # text a model will rewrite. Files are not paraphrasable.
+
+          Path("BUILD_INSTRUCTIONS.md").write_text('''# Builder instructions — read this whole file, then do it
+
+          Read `TASK.md` in this directory. It is a gate report listing three BLOCKERS and
+          four should-fix items. The repo is cloned at `./repo` with 25 reviewed patches
+          already applied. **Work only inside `./repo`.**
+
+          Fix all three blockers exactly as TASK.md specifies:
+
+          1. `src/components/rooms/RoomsShelf.tsx` — the group accents were changed to
+             `var()` values, but lines ~151/152/158 append hex-alpha to them
+             (`${g.accent}55`), which is invalid CSS and drops the whole declaration. The
+             pill border, background and divider must render again. Make all four accent
+             rows consistent with each other.
+          2. `src/lib/cart-reminders.ts` and `src/lib/gift-vouchers.ts` — each has a
+             JSX-style comment `{/* ... */}` inside an HTML template literal, which ships as
+             VISIBLE TEXT in a customer email. Delete them, then grep every template literal
+             under `src/lib` for the same pattern to be certain none remain.
+          3. `src/app/cartridge.css` (~line 236) — `#classes .lockpill` uses a theme-aware
+             token on a card pinned to the same background in both themes, destroying
+             contrast. Restore a pinned value.
+
+          Then do items 4-7 from TASK.md if they are quick, and state plainly which you did
+          and which you skipped.
+
+          Do NOT touch anything TASK.md's "Cleared" section says is already fine. Do not
+          reformat, make no unrelated edits, and change as few lines as possible.
+
+          When done, write `FIX_NOTES.md` in the PARENT directory (not inside `repo/`):
+          per blocker, exactly what you changed and why, plus your answer to item 5's
+          gold-law question.
+          '''.replace("\n          ", "\n"), encoding="utf-8")
+
+          Path("GATE_INSTRUCTIONS.md").write_text('''# Gate instructions — read this whole file, then do it
+
+          You are gating a fix for three blockers. Read `TASK.md` (the original gate report)
+          and `FIX_NOTES.md` (the builder's account) in this directory. The edited repo is
+          `./repo`; the generated patch is `./11-swarm-blocker-fixes.patch`.
+
+          ⚠️ Your shell's working directory PERSISTS between Bash calls. Do not repeat
+          `cd repo` — either `cd` once and stay, or prefer `git -C repo ...` and paths like
+          `repo/src/...` from this directory. Repeated `cd repo` will fail with
+          "No such file or directory" once you are already inside it.
+
+          ## Verify each blocker YOURSELF against real file contents. Never trust FIX_NOTES.md.
+          - **B1** `repo/src/components/rooms/RoomsShelf.tsx` must no longer produce invalid
+            CSS. NOTE: the template strings `${g.accent}55` may legitimately REMAIN — that is
+            correct *if* `g.accent` is now a hex literal. It is only a bug when `g.accent` is
+            a `var()`. Check what the accents actually are before judging, and confirm all
+            four rows are consistent.
+          - **B2** No JSX comments inside template literals in `repo/src/lib` — check
+            `cart-reminders.ts` and `gift-vouchers.ts` specifically.
+          - **B3** `repo/src/app/cartridge.css`'s `#classes .lockpill` colour must be a
+            pinned value, not a theme-aware token.
+
+          ## Then compile
+          From inside `repo/`: `npx --no-install tsc --noEmit`, then
+          `npx --no-install eslint . 2>&1 | tail -20`.
+          On the PRE-FIX stacked tree, tsc exits 0 with no errors — so ANY tsc error is a
+          regression the builder introduced. The MEASURED eslint baseline on that same
+          pre-fix tree is **65 errors / 9 warnings** (verified 0018.05.26; the older brief
+          said 65/10 — 9 is the real number). Report the DELTA against 65/9. Delta zero passes.
+
+          ## Then scope-check
+          Read the patch and flag any hunk that is not clearly one of B1/B2/B3 or a stated
+          should-fix item.
+
+          ## Then WRITE THE FILE — this is the deliverable, not your chat reply
+          Write `REVIEW.md` in this directory containing: a per-blocker PASS/FAIL with the
+          evidence you actually checked, the tsc result, the eslint delta, and any
+          out-of-scope hunks. Anything you could not verify is a FAIL, not a pass.
+
+          The LAST line of REVIEW.md must be exactly one of:
+          VERDICT: APPROVE
+          VERDICT: NEEDS_WORK
+
+          APPROVE requires: all three blockers pass, tsc clean, no out-of-scope edits.
+          End your own reply with that same VERDICT line and nothing after it.
+          '''.replace("\n          ", "\n"), encoding="utf-8")
+
+          print("instructions staged:",
+                Path("BUILD_INSTRUCTIONS.md").stat().st_size,
+                Path("GATE_INSTRUCTIONS.md").stat().st_size, "bytes")
+
           if failed:
               print("SEED FAILED - do not proceed")
               sys.exit(1)
@@ -119,36 +212,19 @@ graph:
         base_url: ${NVIDIA_BASE_URL}
         api_key: ${NVIDIA_API_KEY}
         role: |-
-          You are the Builder node. You do NOT edit any code yourself. You delegate the whole
-          job to Kimi with exactly ONE call to the `kimi_run` tool.
+          You are a dispatcher. You have exactly one tool and you make exactly one call.
 
-          Set `expect_files` to true.
-          Set `timeout_seconds` to 1500.
-          Set `task` to exactly this text, copied verbatim — do not summarise or shorten it:
+          Call `kimi_run` with:
+            task: "Read BUILD_INSTRUCTIONS.md in the current working directory and carry it out in full."
+            expect_files: true
+            timeout_seconds: 1500
 
-          "Read TASK.md in the current working directory. It is a gate report listing three
-          BLOCKERS and four should-fix items in a Next.js/TypeScript repo that has been cloned
-          into ./repo with 25 reviewed patches already applied. Work ONLY inside ./repo.
-          Fix all three blockers exactly as TASK.md specifies. In short: (1) in
-          src/components/rooms/RoomsShelf.tsx the group accents were changed to var() values
-          but lines 151/152/158 append hex-alpha to them, which yields invalid CSS and drops
-          the whole declaration — fix it so the pill border, background and divider render
-          again, and make the four accent rows consistent with each other; (2)
-          src/lib/cart-reminders.ts and src/lib/gift-vouchers.ts each contain a JSX-style
-          comment inside an HTML template literal, which ships as visible text in a customer
-          email — delete those, then grep every template literal under src/lib for the same
-          pattern to be sure none remain; (3) src/app/cartridge.css line ~236 gives
-          #classes .lockpill a theme-aware token on a card whose background is pinned in both
-          themes, destroying contrast — restore a pinned value. Then do items 4-7 from TASK.md
-          if they are quick, and state plainly which you did and which you skipped. Do not fix
-          anything TASK.md's 'Cleared' section says is already fine. Do not reformat files, do
-          not make unrelated edits, and change as few lines as possible. When done, write
-          FIX_NOTES.md in the PARENT directory (not inside repo/) describing, per blocker,
-          exactly what you changed and why, plus your answer on item 5's gold-law question."
+          Then reply in ONE sentence: whether ok was true, and which files changed. If ok was
+          false, say so plainly and quote the error — never report success the tool did not
+          report.
 
-          After the tool returns, reply in one short sentence: whether ok was true, and the
-          files it changed. If ok was false, say so plainly and quote the error — never claim
-          success the tool did not report.
+          Do not do the work yourself. Do not read files. Do not run commands. You have no
+          tool other than `kimi_run`, and attempting any other tool will error.
         params: {}
         tooling:
           - type: function
@@ -226,49 +302,23 @@ graph:
         base_url: ${NVIDIA_BASE_URL}
         api_key: ${NVIDIA_API_KEY}
         role: |-
-          You are the Gate node. You do NOT judge the work yourself — you delegate the review
-          to Claude with exactly ONE call to the `claude_run` tool.
+          You are a dispatcher. You have exactly one tool and you make exactly one call.
 
-          Set `expect_files` to true.
-          Set `timeout_seconds` to 900.
-          Set `allowed_tools` to "Read,Write,Edit,Grep,Glob,Bash".
-          Set `task` to exactly this text, copied verbatim:
+          Call `claude_run` with:
+            task: "Read GATE_INSTRUCTIONS.md in the current working directory and carry it out in full."
+            expect_files: true
+            timeout_seconds: 900
+            allowed_tools: "Read,Write,Edit,Grep,Glob,Bash"
 
-          "You are gating a fix for three blockers. Read TASK.md (the original gate report)
-          and FIX_NOTES.md (the builder's account) in the current directory. The edited repo
-          is ./repo and the generated patch is ./11-swarm-blocker-fixes.patch.
+          The tool returns a `final_text` ending in a verdict line. Reply with that verdict in
+          two or three sentences, and make your LAST line exactly one of:
+          VERDICT: APPROVE
+          VERDICT: NEEDS_WORK
+          Nothing may follow that line — it is the routing keyword. If the tool returned
+          ok: false, or no verdict is present, emit VERDICT: NEEDS_WORK.
 
-          Verify each blocker YOURSELF against the actual file contents — never trust
-          FIX_NOTES.md:
-          B1: src/components/rooms/RoomsShelf.tsx must no longer append hex-alpha directly to
-              a var() value. Confirm the border, background and divider now produce valid CSS,
-              and that the four accent rows are internally consistent.
-          B2: grep -rn '{/\\*' src/lib must return nothing inside template literals; check
-              cart-reminders.ts and gift-vouchers.ts specifically.
-          B3: src/app/cartridge.css's #classes .lockpill colour must be a pinned value, not a
-              theme-aware token.
-
-          Then run, from inside ./repo:
-            npx --no-install tsc --noEmit
-            npx --no-install eslint . 2>&1 | tail -20
-          Report tsc's result exactly — on the pre-fix stacked tree tsc exits 0 with no
-          errors, so ANY tsc error is a regression the builder introduced. For eslint, the
-          MEASURED baseline on that same pre-fix tree is 65 errors / 9 warnings (verified
-          0018.05.26; note the earlier brief said 65/10 — 9 is the real number). Report the
-          DELTA against 65/9, not the absolute count. A delta of zero is a pass.
-
-          Also confirm the builder made no unrelated or cosmetic edits: read the patch and
-          flag any hunk that is not clearly one of B1/B2/B3 or a stated should-fix item.
-
-          Write REVIEW.md with a per-blocker PASS/FAIL plus the evidence you actually checked,
-          the tsc and eslint results, and a list of any out-of-scope hunks. End REVIEW.md with
-          a line that is exactly 'VERDICT: APPROVE' if all three blockers pass, tsc is clean
-          and there are no out-of-scope edits, or exactly 'VERDICT: NEEDS_WORK' otherwise. A
-          thing you could not verify is a FAIL. End your own reply with that same VERDICT line."
-
-          After the tool returns, reply with Claude's findings in two or three sentences. Your
-          final line must be exactly 'VERDICT: APPROVE' or 'VERDICT: NEEDS_WORK' and nothing
-          may follow it — that line is the routing keyword.
+          Do not verify anything yourself. Do not read files. Do not run commands. You have no
+          tool other than `claude_run`, and attempting any other tool will error.
         params: {}
         tooling:
           - type: function
