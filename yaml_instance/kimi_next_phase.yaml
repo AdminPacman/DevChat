@@ -318,6 +318,14 @@ graph:
           REPO = Path("repo")
           BASE = json.loads(Path("BASELINE_COMPILE.json").read_text(encoding="utf-8"))
 
+          # Built at runtime, never written literally. THREE BACKTICKS ANYWHERE IN THIS
+          # SCRIPT — in a string OR in a comment — close the markdown fence that DevChat
+          # uses to extract the code, truncating it mid-statement. The first version of this
+          # node died with "SyntaxError: unterminated string literal" for that reason, and
+          # the fix's own comment then repeated the mistake by naming the fence literally.
+          # Never write the fence characters here; build them.
+          FENCE = chr(96) * 3
+
           def run(args, timeout):
               try:
                   r = subprocess.run(args, cwd=REPO, capture_output=True, text=True,
@@ -343,9 +351,9 @@ graph:
               out.append("- **PASS** — no type errors.")
           else:
               out.append("- **FAIL** — type errors below.")
-              out.append("```")
+              out.append(FENCE)
               out.append(txt[-2500:])
-              out.append("```")
+              out.append(FENCE)
 
           # --- eslint ----------------------------------------------------------------------
           rc2, txt2 = run(["npx", "--no-install", "eslint", "."], 900)
@@ -357,13 +365,13 @@ graph:
           out.append(f"- delivered: **{err} errors / {warn} warnings**")
           if None in (err, warn, berr, bwarn):
               out.append("- **INCONCLUSIVE** — could not parse a count. Raw tail:")
-              out.append("```"); out.append(txt2[-1500:]); out.append("```")
+              out.append(FENCE); out.append(txt2[-1500:]); out.append(FENCE)
           else:
               d_e, d_w = err - berr, warn - bwarn
               out.append(f"- **DELTA: {d_e:+d} errors / {d_w:+d} warnings**")
               out.append("- **PASS**" if (d_e <= 0 and d_w <= 0) else "- **FAIL** — this change adds lint.")
               if d_e > 0 or d_w > 0:
-                  out.append("```"); out.append(txt2[-2000:]); out.append("```")
+                  out.append(FENCE); out.append(txt2[-2000:]); out.append(FENCE)
 
           # --- build -----------------------------------------------------------------------
           # Kept last: it is the slowest, and a failure here is worth knowing even if tsc/lint
@@ -379,7 +387,7 @@ graph:
               out.append("- **FAIL** — tail below. Judge whether this is the change or the environment;")
               out.append("  a turbopack/workspace-root complaint about the symlinked node_modules is")
               out.append("  environmental, a type or import error is not.")
-              out.append("```"); out.append(txt3[-2500:]); out.append("```")
+              out.append(FENCE); out.append(txt3[-2500:]); out.append(FENCE)
 
           Path("COMPILE_RESULTS.md").write_text("\n".join(out) + "\n", encoding="utf-8")
           print("\n".join(out[:14]))
