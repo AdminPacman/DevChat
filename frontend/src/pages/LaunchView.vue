@@ -94,6 +94,13 @@
                       <span class="loading-entry-duration">
                         {{ formatDuration(entry.startedAt, entry.endedAt || null) }}
                       </span>
+                      <!-- Live tail of the agent's own output. Only appears while a
+                           fleet call is in flight and has actually written something. -->
+                      <pre v-if="entry.status === 'running' && entry.tail" class="agent-tail">{{ entry.tail }}</pre>
+                      <span
+                        v-if="entry.status === 'running' && entry.tail && entry.tailStale > 30"
+                        class="agent-tail-quiet"
+                      >quiet for {{ Math.round(entry.tailStale) }}s — may be thinking, not necessarily stuck</span>
                     </div>
                   </TransitionGroup>
 
@@ -493,7 +500,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { fetchWorkflowsWithDesc, fetchLogsZip, fetchWorkflowYAML, postFile, getAttachment, fetchVueGraphLayout, postVueGraphLayout } from '../utils/apiFunctions.js'
+import { fetchWorkflowsWithDesc, fetchLogsZip, fetchWorkflowYAML, postFile, getAttachment, fetchVueGraphLayout, postVueGraphLayout, fetchAgentTail } from '../utils/apiFunctions.js'
 import { configStore } from '../utils/configStore.js'
 import { spriteFetcher } from '../utils/spriteFetcher.js'
 import yaml from 'js-yaml'
@@ -666,6 +673,47 @@ const addLoadingEntry = (nodeId, baseKey, label) => {
     startLoadingTimer()
   }
   return entry
+}
+
+// ── Live agent tail ─────────────────────────────────────────────────────────
+// Fleet calls (kimi_run / claude_run / pi_run) are long and, until now, totally
+// silent: the WebSocket emits nothing between a tool call's start and its finish
+// — on a real measured run that was a 21.6-minute gap showing only a ticking
+// clock that is a plain Date.now() diff. The child's output was streaming to
+// _agent_logs/<label>.live.log the whole time and nothing read it. This does.
+const FLEET_TOOLS = { kimi_run: 'kimi', claude_run: 'claude', pi_run: 'pi' }
+const TAIL_POLL_MS = 3000
+const tailPollers = new Map()
+
+const startAgentTail = (entry, toolName) => {
+  const label = FLEET_TOOLS[toolName]
+  if (!entry || !label || !sessionId || tailPollers.has(entry.key)) return
+
+  const poll = async () => {
+    // The run may have ended, or the user switched away, between ticks.
+    if (!sessionId || entry.status !== 'running') return stopAgentTail(entry.key)
+    const result = await fetchAgentTail(sessionId, label)
+    if (result?.success && result.exists) {
+      entry.tail = result.tail
+      entry.tailStale = result.staleSeconds
+    }
+  }
+
+  poll()
+  tailPollers.set(entry.key, setInterval(poll, TAIL_POLL_MS))
+}
+
+const stopAgentTail = (key) => {
+  const handle = tailPollers.get(key)
+  if (handle) {
+    clearInterval(handle)
+    tailPollers.delete(key)
+  }
+}
+
+const stopAllAgentTails = () => {
+  tailPollers.forEach((handle) => clearInterval(handle))
+  tailPollers.clear()
 }
 
 // Finish a loading entry
@@ -1652,6 +1700,7 @@ onUnmounted(() => {
   cleanupRecording()
 
   stopLoadingTimer()
+  stopAllAgentTails()
   runningLoadingEntries.value = 0
 })
 
@@ -2287,8 +2336,11 @@ const processMessage = async (msg) => {
     else if (eventType === 'TOOL_CALL') {
       // Tool call started
       if (msg.data.details.stage === "before") {
-        const baseKey = `tool-${msg.data.details.tool_name || 'unknown'}`
-        addLoadingEntry(nodeId, baseKey, `Tool ${msg.data.details.tool_name}`)
+        const toolName = msg.data.details.tool_name || 'unknown'
+        const baseKey = `tool-${toolName}`
+        const entry = addLoadingEntry(nodeId, baseKey, `Tool ${toolName}`)
+        // Fleet calls get a live tail; everything else is fast enough not to need one.
+        startAgentTail(entry, toolName)
       }
 
       // Tool call ended
@@ -2873,6 +2925,8 @@ watch(
 .loading-entry {
   display: flex;
   align-items: center;
+  /* wrap so the live tail drops onto its own row instead of stretching the pill */
+  flex-wrap: wrap;
   gap: 6px;
   padding: 6px 10px;
   border-radius: 10px;
@@ -2880,6 +2934,31 @@ watch(
   border: 1px solid rgba(255, 255, 255, 0.12);
   position: relative;
   backdrop-filter: blur(4px);
+}
+
+/* The agent's own output, streaming. Deliberately small and scrollable: this is a
+   peephole onto a log that may be megabytes, not a replacement for reading it. */
+.agent-tail {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  max-height: 130px;
+  overflow: auto;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.agent-tail-quiet {
+  flex-basis: 100%;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.38);
 }
 
 .loading-entry-label {

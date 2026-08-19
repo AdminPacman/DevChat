@@ -334,6 +334,34 @@ export async function postVuegraphs({ filename, content }) {
   }
 }
 
+// Tail a fleet agent's live log while its call is still in flight.
+// The server caps the response; this is a peephole, not a log download.
+export async function fetchAgentTail(sessionId, label) {
+  try {
+    const response = await fetch(
+      apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/agent-tail?label=${encodeURIComponent(label)}`)
+    )
+    const data = await response.json().catch(() => ({}))
+
+    if (response.ok) {
+      return {
+        success: true,
+        exists: !!data?.exists,
+        tail: data?.tail || '',
+        size: data?.size || 0,
+        staleSeconds: data?.stale_seconds ?? null
+      }
+    }
+
+    return { success: false, status: response.status, detail: data?.detail }
+  } catch {
+    // Polling failures are expected and boring (run ended, tab backgrounded).
+    // Stay quiet: this is an ambient nicety, not a control path — and an optional
+    // catch binding keeps the deliberate silence from tripping no-unused-vars.
+    return { success: false, message: 'API error' }
+  }
+}
+
 // Fetch the saved canvas layout (node positions + viewport).
 // Distinct from fetchVueGraph: layout lives in its own column so that syncing
 // YAML cannot overwrite it. `layout: null` is a normal answer meaning "nobody has
