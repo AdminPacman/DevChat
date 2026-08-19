@@ -59,6 +59,11 @@ MAX_RETURN_CHARS = 4000
 # How much of a single captured field (final message, stderr) we keep before eliding.
 MAX_FIELD_CHARS = 1500
 
+# Most file paths we will enumerate in a tool return. Beyond this we report counts:
+# an agent's own scratch tree can run to thousands of paths, and a return value is
+# for facts a node can act on, not for a directory listing.
+MAX_FILES_LISTED = 40
+
 # Files we never count as "produced work" when diffing a workspace.
 _IGNORED_TREE_NAMES = {".git", "__pycache__", "node_modules", ".pi", ".DS_Store"}
 
@@ -499,12 +504,29 @@ def run_agent(
     else:
         error = None
 
+    # Cap the file lists. An agent that builds its own scratch tree (Kimi legitimately
+    # creates work/ and outbox/ with a `prev-tree` snapshot inside the workspace) can produce
+    # thousands of paths, and enumerating them all put 164 KB into a node's context on the
+    # first P3 run — the same "raw data as a return value" defect the stream summariser was
+    # written to kill, just wearing a different hat. Counts are what a downstream node can
+    # actually act on; the full listing is reconstructible from the workspace on disk.
+    file_counts = {k: len(v) for k, v in files.items()}
+    capped_files: Dict[str, Any] = {}
+    for key, paths in files.items():
+        if len(paths) > MAX_FILES_LISTED:
+            capped_files[key] = paths[:MAX_FILES_LISTED] + [
+                f"…and {len(paths) - MAX_FILES_LISTED} more (see {workspace})"
+            ]
+        else:
+            capped_files[key] = paths
+
     result: Dict[str, Any] = {
         "ok": error is None,
         "agent": label,
         "error": error,
         "returncode": returncode,
-        "files": files,
+        "files": capped_files,
+        "file_counts": file_counts,
         "tool_calls": summary["tool_calls"][:20],
         "final_text": summary["final_text"],
         "usage": summary.get("usage"),
@@ -517,7 +539,14 @@ def run_agent(
     if len(blob) > MAX_RETURN_CHARS:
         result["tool_calls"] = result["tool_calls"][:5]
         result["final_text"] = _elide(result["final_text"], 800)
+        # If the file lists are still what's blowing it, drop to counts only.
+        if len(json.dumps(result["files"], default=str)) > MAX_RETURN_CHARS // 2:
+            result["files"] = {
+                k: (v[:5] + [f"…{len(files[k]) - 5} more"] if len(files[k]) > 5 else v)
+                for k, v in files.items()
+            }
         result["truncated"] = (
-            f"result compacted to fit node context; full stream at {raw_path or 'unavailable'}"
+            f"result compacted to fit node context; counts in file_counts, "
+            f"full stream at {raw_path or 'unavailable'}"
         )
     return result
