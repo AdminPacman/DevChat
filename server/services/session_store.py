@@ -1,6 +1,7 @@
 """Session persistence primitives for workflow runs."""
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -8,6 +9,28 @@ from threading import Event
 from typing import Any, Dict, Optional
 
 from server.services.artifact_events import ArtifactEventQueue
+
+
+def _buffer_size_default() -> int:
+    """How many messages a session keeps for reconnect replay.
+
+    This is the ONLY cap on how much of a run you can still see after refreshing or
+    reopening the console — the WebSocket manager replays this buffer on reconnect, and
+    anything evicted from it is gone from the live view (the on-disk WareHouse artifacts
+    are unaffected and remain the durable record).
+
+    The stock 1000 is low for crew runs: one graph fanning out to kimi/claude/pi
+    subprocesses emits a lot of node, tool and stream events, so a long run silently loses
+    its own beginning — `append_message` evicts from the FRONT. Raised to 5000, overridable
+    via DEVCHAT_SESSION_BUFFER for very long unattended runs.
+    """
+    raw = os.environ.get("DEVCHAT_SESSION_BUFFER", "5000")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logging.warning("DEVCHAT_SESSION_BUFFER=%r is not an integer; using 5000", raw)
+        return 5000
+    return max(100, value)
 
 
 class SessionStatus(Enum):
@@ -59,7 +82,7 @@ class WorkflowSession:
     # Message buffer for reconnection replay
     message_buffer: list = field(default_factory=list)
 
-    MAX_BUFFER_SIZE: int = 1000
+    MAX_BUFFER_SIZE: int = field(default_factory=_buffer_size_default)
 
     def append_message(self, message: Dict[str, Any]) -> None:
         if len(self.message_buffer) >= self.MAX_BUFFER_SIZE:
