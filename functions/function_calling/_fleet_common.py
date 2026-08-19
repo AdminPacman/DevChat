@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 from pathlib import Path
@@ -329,6 +330,46 @@ def resolve_workspace(context: Optional[Dict[str, Any]], tool_name: str) -> Path
     return path
 
 
+def _kill_process_group(proc: "subprocess.Popen[str]") -> None:
+    """Terminate an agent and every process it spawned, politely then firmly.
+
+    Agent CLIs fan out (model calls, tool subprocesses, their own shells). Killing only the
+    launcher orphans that whole tree — and an orphaned agent keeps running and keeps billing.
+    Because the child was started with `start_new_session=True` it leads its own process
+    group, so signalling the group catches everything.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        pgid = None
+
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_agent(
     *,
     label: str,
@@ -344,8 +385,10 @@ def run_agent(
     `expect_files` is set — the workspace actually changed. See defect 2 in this module's
     docstring for why exit code alone is not trustworthy.
 
-    The full stdout is persisted to `<workspace>/_agent_logs/` and referenced by path; only
-    the summary crosses back into graph context.
+    The full stdout is STREAMED LIVE to `<workspace>/_agent_logs/<label>.live.log` while the
+    process runs, so a long build is watchable with `tail -f` instead of being a black box
+    until it exits. On completion the same content is persisted under a numbered name and
+    referenced by `raw_log`; only the compact summary crosses back into graph context.
     """
     before = snapshot_tree(workspace)
 
@@ -353,22 +396,64 @@ def run_agent(
     if env:
         run_env.update(env)
 
+    # Live log. `subprocess.run(capture_output=True)` buffers everything until exit, which
+    # means a 20-minute Kimi build shows NOTHING the entire time — there was no verbose mode
+    # to turn on, because nothing was being written. Streaming to a file fixes that without
+    # putting a byte more into graph context: the tool return stays the same compact summary.
+    live_path: Optional[Path] = None
     try:
-        completed = subprocess.run(
-            cmd,
-            cwd=str(workspace),
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=run_env,
-        )
-        raw_out = completed.stdout or ""
-        raw_err = completed.stderr or ""
-        returncode: Optional[int] = completed.returncode
-        timed_out = False
+        logs_dir = workspace / "_agent_logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        live_path = logs_dir / f"{label}.live.log"
+    except OSError:
+        live_path = None
+
+    try:
+        if live_path is not None:
+            # Popen + a real file handle: the OS writes through as the agent produces output,
+            # so `tail -f` sees it immediately. stderr is merged in so failures are visible in
+            # the same stream rather than vanishing until exit.
+            with open(live_path, "w", encoding="utf-8", errors="replace") as live_fh:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(workspace),
+                    stdout=live_fh,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=run_env,
+                    # Own process group, so a timeout can kill the agent AND its children.
+                    # Without this, `proc.kill()` reaps only the launcher: an agent CLI that
+                    # has spawned its own model/tool subprocesses leaves them orphaned and
+                    # still billing. Verified: a bare kill left a live `sleep` behind.
+                    start_new_session=True,
+                )
+                try:
+                    proc.wait(timeout=timeout_seconds)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    _kill_process_group(proc)
+                    timed_out = True
+            raw_out = live_path.read_text(encoding="utf-8", errors="replace")
+            raw_err = "" if not timed_out else raw_out[-2000:]
+            returncode: Optional[int] = None if timed_out else proc.returncode
+        else:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(workspace),
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=run_env,
+            )
+            raw_out = completed.stdout or ""
+            raw_err = completed.stderr or ""
+            returncode = completed.returncode
+            timed_out = False
     except subprocess.TimeoutExpired as exc:
         raw_out = exc.stdout if isinstance(exc.stdout, str) else ""
         raw_err = exc.stderr if isinstance(exc.stderr, str) else ""
