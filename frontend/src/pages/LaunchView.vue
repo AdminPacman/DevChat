@@ -308,7 +308,7 @@
         </div>
 
         <div v-show="viewMode === 'graph'" class="graph-panel">
-          <VueFlow class="vueflow-graph">
+          <VueFlow class="vueflow-graph" @node-drag-stop="onNodeDragStop">
             <template #node-workflow-node="props">
               <WorkflowNode
                 :id="props.id"
@@ -493,7 +493,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { fetchWorkflowsWithDesc, fetchLogsZip, fetchWorkflowYAML, postFile, getAttachment, fetchVueGraph } from '../utils/apiFunctions.js'
+import { fetchWorkflowsWithDesc, fetchLogsZip, fetchWorkflowYAML, postFile, getAttachment, fetchVueGraphLayout, postVueGraphLayout } from '../utils/apiFunctions.js'
 import { configStore } from '../utils/configStore.js'
 import { spriteFetcher } from '../utils/spriteFetcher.js'
 import yaml from 'js-yaml'
@@ -528,7 +528,29 @@ import CollapsibleMessage from '../components/CollapsibleMessage.vue'
 const router = useRouter()
 const route = useRoute()
 const { t } = useI18n()
-const { fromObject, fitView, onPaneReady, onNodesInitialized, setNodes, setEdges, nodes, edges } = useVueFlow()
+const { fromObject, toObject, fitView, onPaneReady, onNodesInitialized, setNodes, setEdges, nodes, edges } = useVueFlow()
+
+// Persist a drag on the RUN CONSOLE. This page had no drag handler at all, so
+// arranging nodes while watching a run was silently discarded — whether your
+// layout survived depended on which page you happened to drag it in.
+const onNodeDragStop = async () => {
+  const selection = selectedFile.value
+  if (!selection) return
+  const key = selection.replace(/\.yaml$/i, '')
+  if (!key) return
+
+  try {
+    const result = await postVueGraphLayout({
+      filename: key,
+      layout: JSON.stringify(toObject())
+    })
+    if (!result?.success) {
+      console.error('Failed to save canvas layout:', result?.message || result?.detail)
+    }
+  } catch (error) {
+    console.error('Failed to save canvas layout:', error)
+  }
+}
 
 const getTranslatedStatus = (statusText) => {
   if (!statusText) return ''
@@ -1768,18 +1790,14 @@ const loadVueFlowGraph = async ({ fit = false } = {}) => {
   }
 
   try {
-    const result = await fetchVueGraph(key)
+    const result = await fetchVueGraphLayout(key)
 
     if (selectedFile.value !== selectionSnapshot) {
       return false
-    }
-
-    if (result?.status === 404) {
-      return await runFallback()
     }
 
     if (!result?.success) {
-      console.error('Failed to load VueFlow graph:', result?.message || result?.detail)
+      console.error('Failed to load canvas layout:', result?.message || result?.detail)
       return await runFallback()
     }
 
@@ -1787,17 +1805,22 @@ const loadVueFlowGraph = async ({ fit = false } = {}) => {
       return false
     }
 
-    const content = result?.content
+    const layout = result?.layout
 
-    if (!content) {
+    // No layout is the normal answer for a graph nobody has arranged yet.
+    if (!layout) {
       return await runFallback()
     }
 
     let flow
     try {
-      flow = JSON.parse(content)
+      flow = JSON.parse(layout)
     } catch (parseError) {
-      console.error('Failed to parse saved VueFlow graph:', parseError)
+      console.error(
+        `[layout] Saved canvas layout for "${key}" could not be read; showing a generated ` +
+        'one instead. The stored layout has NOT been overwritten.',
+        parseError
+      )
       return await runFallback()
     }
 

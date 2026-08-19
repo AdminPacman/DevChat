@@ -338,7 +338,7 @@ import StartNode from '../components/StartNode.vue'
 import FormGenerator from '../components/FormGenerator.vue'
 import RichTooltip from '../components/RichTooltip.vue'
 import yaml from 'js-yaml'
-import { fetchYaml, fetchVueGraph, postVuegraphs, updateYaml, postYamlNameChange, postYamlCopy } from '../utils/apiFunctions'
+import { fetchYaml, fetchVueGraphLayout, postVueGraphLayout, updateYaml, postYamlNameChange, postYamlCopy } from '../utils/apiFunctions'
 import { helpContent } from '../utils/helpContent.js'
 import { configStore } from '../utils/configStore.js'
 
@@ -765,61 +765,67 @@ const saveVueFlowGraph = async () => {
   try {
     const flowObj = toObject()
     const key = currentWorkflowName.value
-    const result = await postVuegraphs({
+    // Writes the LAYOUT column, not `content`. Previously both the canvas and
+    // `make sync` wrote the same field, so whichever ran last erased the other.
+    const result = await postVueGraphLayout({
       filename: key,
-      content: JSON.stringify(flowObj)
+      layout: JSON.stringify(flowObj)
     })
 
     if (!result?.success) {
-      console.error('Failed to save VueFlow graph:', result?.message || result?.detail)
+      console.error('Failed to save canvas layout:', result?.message || result?.detail)
       return false
     }
     return true
   } catch (error) {
-    console.error('Failed to save VueFlow graph:', error)
+    console.error('Failed to save canvas layout:', error)
     return false
   }
 }
 
 const loadAndSyncVueFlowGraph = async () => {
-  try {
-    const key = currentWorkflowName.value
-    const result = await fetchVueGraph(key)
+  const key = currentWorkflowName.value
+  let hadStoredLayout = false
 
-    if(result?.success === true) {
-      console.log("Graph fetched successfully")
+  try {
+    const result = await fetchVueGraphLayout(key)
+
+    if (!result?.success) {
+      console.error('Failed to load canvas layout:', result?.message || result?.detail)
+      // A LOOKUP failure is not the same as "no layout". Do not persist over
+      // whatever is stored just because we could not read it this time.
+      await generateNodesAndEdges({ persist: false })
+      return false
     }
 
-    if (result?.status === 404) {
-      // Not found in server storage, fallback
-      console.log("No graph found, fallback to generation")
+    const layout = result?.layout
+    if (!layout) {
+      // Nobody has arranged this graph yet — the normal first-open path.
+      // Computing a layout AND saving it is correct here: there is nothing to lose.
       await generateNodesAndEdges()
       return false
     }
 
-    if (!result?.success) {
-      console.error('Failed to load VueFlow graph:', result?.message || result?.detail)
-      // Fallback if server error
-      generateNodesAndEdges()
-      return false
-    }
-
-    const content = result?.content
-    if (content) {
-      const flow = JSON.parse(content)
-      if (flow) {
-        fromObject(flow)
-        await nextTick()
-        syncVueNodesAndEdgesData()
-        return true
-      }
+    hadStoredLayout = true
+    const flow = JSON.parse(layout)
+    if (flow) {
+      fromObject(flow)
+      await nextTick()
+      syncVueNodesAndEdgesData()
+      return true
     }
   } catch (error) {
-    console.error('Failed to load saved VueFlow graph:', error)
+    console.error(
+      `[layout] Saved canvas layout for "${key}" could not be read, so a fresh one was ` +
+      'generated for display. YOUR SAVED ARRANGEMENT HAS NOT BEEN OVERWRITTEN — drag any ' +
+      'node to replace it deliberately, or leave it and report this.',
+      error
+    )
   }
 
-  // If no VueFlow graph restored, fall back to manual generation
-  await generateNodesAndEdges()
+  // Reached only when a stored layout existed but was unreadable, or produced
+  // nothing usable. Display a generated layout WITHOUT persisting it.
+  await generateNodesAndEdges({ persist: hadStoredLayout ? false : undefined })
   return false
 }
 
@@ -1205,6 +1211,10 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
   }
 }
 
+// options.persist === false regenerates for DISPLAY ONLY, without writing over
+// whatever is stored. Used when a saved layout exists but could not be read: the
+// old behaviour auto-saved the fresh grid on top of it, which turned a recoverable
+// read failure into permanent data loss, silently.
 const generateNodesAndEdges = async (options = {}) => {
   updateNodesAndEdgesFromYaml(false)
 
@@ -1214,7 +1224,9 @@ const generateNodesAndEdges = async (options = {}) => {
     if (options.fit) {
       fitView?.({ padding: 0.1 })
     }
-    await saveVueFlowGraph()
+    if (options.persist !== false) {
+      await saveVueFlowGraph()
+    }
   } catch (err) {
     console.warn('Failed to persist generated VueFlow graph:', err)
   }
@@ -1783,14 +1795,17 @@ const handleRenameSubmit = async () => {
 
     // Save VueGraph into new workflow
     try {
-      const oldVueGraphResult = await fetchVueGraph(oldWorkflowKey)
-      if (oldVueGraphResult.success && oldVueGraphResult.content) {
-        const saveResult = await postVuegraphs({
+      // Carry the LAYOUT to the new name. It used to read/write `content`, which
+      // now holds YAML — copying that here would have written YAML into the new
+      // graph's layout slot and lost the arrangement on rename.
+      const oldLayoutResult = await fetchVueGraphLayout(oldWorkflowKey)
+      if (oldLayoutResult.success && oldLayoutResult.layout) {
+        const saveResult = await postVueGraphLayout({
           filename: newWorkflowKey,
-          content: oldVueGraphResult.content
+          layout: oldLayoutResult.layout
         })
         if (!saveResult.success) {
-          console.warn('Failed to rename VueGraph:', saveResult.message)
+          console.warn('Failed to carry canvas layout to the renamed graph:', saveResult.message)
         }
       }
     } catch (error) {
@@ -1840,16 +1855,16 @@ const handleCopySubmit = async () => {
     const targetWorkflowKey = newName
 
     try {
-      // Load the VueGraph for the source workflow
-      const sourceVueGraphResult = await fetchVueGraph(sourceWorkflowKey)
-      if (sourceVueGraphResult.success && sourceVueGraphResult.content) {
-        // Save the VueGraph with the new workflow name
-        const saveResult = await postVuegraphs({
+      // Copy the source graph's LAYOUT to the duplicate, so a copied workflow
+      // opens arranged the way its original was rather than snapping to a grid.
+      const sourceLayoutResult = await fetchVueGraphLayout(sourceWorkflowKey)
+      if (sourceLayoutResult.success && sourceLayoutResult.layout) {
+        const saveResult = await postVueGraphLayout({
           filename: targetWorkflowKey,
-          content: sourceVueGraphResult.content
+          layout: sourceLayoutResult.layout
         })
         if (!saveResult.success) {
-          console.warn('Failed to copy VueGraph:', saveResult.message)
+          console.warn('Failed to copy canvas layout:', saveResult.message)
         }
       }
     } catch (error) {

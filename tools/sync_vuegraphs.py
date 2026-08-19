@@ -10,6 +10,23 @@ Purpose:
 - Required after modifying workflow YAML files to see changes in the UI
 - Useful for development and deployment workflows
 
+SAFE SINCE THE LAYOUT SPLIT — and why this warning is here:
+    This tool globs the ENTIRE yaml_instance/ directory and blind-writes every
+    file, not just the one you edited. It used to write into the same `content`
+    column the canvas stored its node positions in, so a single `make sync` —
+    the step the README tells you to run after every YAML edit — destroyed the
+    saved layout of every graph in the library. The frontend then swallowed the
+    resulting JSON.parse failure, regenerated a cramped grid, and saved that on
+    top. Layouts vanished on refresh and nothing ever said why.
+
+    Canvas layout now lives in its own `layout` column and this endpoint writes
+    `content` only, so the collision is structurally impossible rather than
+    merely discouraged.
+
+    DO NOT "optimize" this by having the upload endpoint write both fields, and
+    do not add a layout field to this tool. The whole fix is that these two
+    writers never touch the same column.
+
 Usage:
     python tools/sync_vuegraphs.py
     # or via Makefile:

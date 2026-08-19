@@ -334,6 +334,77 @@ export async function postVuegraphs({ filename, content }) {
   }
 }
 
+// Fetch the saved canvas layout (node positions + viewport).
+// Distinct from fetchVueGraph: layout lives in its own column so that syncing
+// YAML cannot overwrite it. `layout: null` is a normal answer meaning "nobody has
+// arranged this graph yet" — not a failure.
+export async function fetchVueGraphLayout(key) {
+  try {
+    const response = await fetch(apiUrl(`/api/vuegraphs/${encodeURIComponent(key)}/layout`))
+    const data = await response.json().catch(() => ({}))
+
+    if (response.ok) {
+      return {
+        success: true,
+        layout: data?.layout ?? null,
+        status: response.status
+      }
+    }
+
+    return {
+      success: false,
+      status: response.status,
+      detail: data?.detail,
+      message: data?.message || 'Failed to fetch canvas layout'
+    }
+  } catch (error) {
+    console.error('Error fetching canvas layout:', error)
+    return {
+      success: false,
+      message: 'API error'
+    }
+  }
+}
+
+// Save the canvas layout. Writes ONLY the layout column — a dragged node can
+// never clobber the graph's YAML, and vice versa.
+export async function postVueGraphLayout({ filename, layout }) {
+  try {
+    const response = await fetch(apiUrl('/api/vuegraphs/upload/layout'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        filename,
+        layout
+      })
+    })
+
+    const data = await response.json().catch(() => ({}))
+
+    if (response.ok) {
+      return {
+        success: true,
+        message: data?.message || 'Canvas layout saved'
+      }
+    }
+
+    return {
+      success: false,
+      status: response.status,
+      detail: data?.detail,
+      message: data?.message || 'Failed to save canvas layout'
+    }
+  } catch (error) {
+    console.error('Error saving canvas layout:', error)
+    return {
+      success: false,
+      message: 'API error'
+    }
+  }
+}
+
 // Fetch the config schema
 export async function fetchConfigSchema(breadcrumbs) {
   try {

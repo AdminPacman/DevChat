@@ -42,3 +42,15 @@ class WorkflowCopyRequest(BaseModel):
 class VueGraphContentPayload(BaseModel):
     filename: constr(strip_whitespace=True, min_length=1, max_length=255)
     content: str
+
+
+class VueGraphLayoutPayload(BaseModel):
+    """Canvas layout (serialized VueFlow nodes/edges/viewport) for one graph.
+
+    Deliberately separate from VueGraphContentPayload: layout and YAML content are
+    written by different actors — the canvas versus `make sync` — and must never
+    share a field, which is precisely how they used to overwrite each other.
+    """
+
+    filename: constr(strip_whitespace=True, min_length=1, max_length=255)
+    layout: str
