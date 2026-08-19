@@ -35,7 +35,7 @@ graph:
         role: user
         content: |-
           ```python
-          import glob, os, shutil, subprocess, sys
+          import glob, os, re, shutil, subprocess, sys
           from pathlib import Path
 
           SRC   = Path("/home/pac/dev/onecocreation")
@@ -77,10 +77,49 @@ graph:
           dirty = run(["git", "status", "--porcelain"], cwd=REPO).stdout.strip()
           print("clone pristine:", "yes" if not dirty else "NO - unexpected")
 
-          link = REPO / "node_modules"
-          if not link.exists():
-              os.symlink(SRC / "node_modules", link)
-          print("node_modules symlinked:", link.is_dir())
+          # node_modules must exist before anything can compile.
+          #
+          # NOT a symlink. Turbopack rejects one that escapes the project root —
+          #   "Symlink .../repo/node_modules is invalid, it points out of the filesystem root"
+          # — which failed every `npm run build` in the first P3 run and made the builder's
+          # "build green" claim untrue for the delivered tree. NOT a plain copy either: 692 MB
+          # per run. NOT `cp -al` hardlinks: those share inodes, so anything the build rewrites
+          # in place would corrupt the REAL node_modules.
+          #
+          # /home is btrfs, so reflink gives a real directory with copy-on-write semantics:
+          # ~1.5s, negligible disk, and writes stay isolated from the source. Falls back to a
+          # plain copy on a filesystem without reflink (slow but correct) — never to a symlink.
+          nm = REPO / "node_modules"
+          if not nm.exists():
+              _cp = run(["cp", "-a", "--reflink=auto", str(SRC / "node_modules"), str(nm)],
+                        check=False)
+              if _cp.returncode != 0 or not nm.is_dir():
+                  print("node_modules copy FAILED:", _cp.stderr[:300]); sys.exit(1)
+          print("node_modules ready:", nm.is_dir(), "| symlink:", nm.is_symlink(),
+                "(must be False, or turbopack will refuse the build)")
+
+          # --- BASELINE COMPILE, measured now, on the untouched tree. ----------------------
+          # The gate used to be told to measure this itself. It could not: every execution
+          # command (npx/npm/node/git) was refused when `claude -p` is spawned by the DevChat
+          # server, which does not inherit an interactive session's trust. The gate honestly
+          # recorded tsc/eslint/build as FAIL-cannot-verify — correct, and useless.
+          # So the graph measures and the agent judges. Same division as everywhere else:
+          # scripts measure, agents reason about the measurement.
+          import json as _json
+          baseline = {}
+          _tsc = run(["npx", "--no-install", "tsc", "--noEmit"], cwd=REPO, check=False)
+          baseline["tsc_exit"] = _tsc.returncode
+          baseline["tsc_tail"] = (_tsc.stdout or _tsc.stderr or "")[-1500:]
+          _lint = run(["npx", "--no-install", "eslint", "."], cwd=REPO, check=False)
+          _lt = ((_lint.stdout or "") + (_lint.stderr or ""))[-3000:]
+          baseline["eslint_tail"] = _lt
+          _m = re.search(r"(\d+)\s+problems?\s*\((\d+)\s+errors?,\s*(\d+)\s+warnings?\)", _lt)
+          baseline["eslint_errors"] = int(_m.group(2)) if _m else None
+          baseline["eslint_warnings"] = int(_m.group(3)) if _m else None
+          Path("BASELINE_COMPILE.json").write_text(_json.dumps(baseline, indent=1), encoding="utf-8")
+          print("baseline tsc exit:", baseline["tsc_exit"],
+                "| eslint:", baseline["eslint_errors"], "errors,",
+                baseline["eslint_warnings"], "warnings")
 
           # --- instructions ON DISK. Never routed through a model. --------------------------
           # 0018.05.26: an 1881-char instruction relayed via a 30B choreography model arrived
@@ -121,13 +160,20 @@ graph:
           Pay particular attention to any copy the brief marks as verbatim or forbidden — the
           exact wording matters, and forbidden claims are blockers.
 
-          ## Compile
-          From inside `repo/`:
-            npx --no-install tsc --noEmit
-            npx --no-install eslint . 2>&1 | tail -20
-          MEASURE the baseline yourself rather than trusting a quoted number: stash the
-          changes, run both on the pre-change tree, restore, and report the DELTA. Do not
-          leave anything stashed. tsc must be clean; an eslint delta of zero passes.
+          ## Compile — ALREADY MEASURED FOR YOU. Do not run these yourself.
+          Read `COMPILE_RESULTS.md`. The graph ran tsc, eslint and the production build
+          deterministically — eslint's baseline was measured on the untouched tree at seed
+          time, so the delta in that file is real, not quoted at you. Report its numbers as
+          your compile findings.
+
+          Do NOT try to run npx/npm/node/git. Command execution is refused for this session
+          (it is spawned by a server process, not an interactive one), which is exactly why
+          the measuring moved into the graph. Attempting it wastes turns and proves nothing.
+
+          tsc must be clean and the eslint delta must not be positive. If the BUILD failed,
+          read the tail and judge whether it is this change or the environment — a turbopack
+          workspace-root complaint about the symlinked node_modules is environmental; a type
+          or import error is the change.
 
           ## Scope-check
           Read the patch. Flag any hunk that is not clearly required by TASK.md.
@@ -240,6 +286,101 @@ graph:
         args: []
         env: {}
         timeout_seconds: 180
+        encoding: utf-8
+
+    # ── 3b. COMPILE — deterministic. The graph measures; the gate judges. ────────────────
+    - id: Compile_Script
+      type: literal
+      description: Fixed Python. Runs tsc / eslint / build on the delivered tree and writes the numbers.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import json, re, subprocess
+          from pathlib import Path
+
+          REPO = Path("repo")
+          BASE = json.loads(Path("BASELINE_COMPILE.json").read_text(encoding="utf-8"))
+
+          def run(args, timeout):
+              try:
+                  r = subprocess.run(args, cwd=REPO, capture_output=True, text=True,
+                                     timeout=timeout)
+                  return r.returncode, (r.stdout or "") + (r.stderr or "")
+              except subprocess.TimeoutExpired:
+                  return None, f"TIMED OUT after {timeout}s"
+
+          def lint_counts(text):
+              m = re.search(r"(\d+)\s+problems?\s*\((\d+)\s+errors?,\s*(\d+)\s+warnings?\)", text)
+              return (int(m.group(2)), int(m.group(3))) if m else (None, None)
+
+          out = ["# Compile results — measured by the graph, not claimed by an agent", ""]
+          out.append(f"Baseline commit: `{Path('BASELINE_SHA').read_text().strip()}`")
+          out.append("")
+
+          # --- tsc -------------------------------------------------------------------------
+          rc, txt = run(["npx", "--no-install", "tsc", "--noEmit"], 900)
+          out.append("## tsc --noEmit")
+          out.append(f"- baseline exit: **{BASE.get('tsc_exit')}**")
+          out.append(f"- delivered exit: **{rc}**")
+          if rc == 0:
+              out.append("- **PASS** — no type errors.")
+          else:
+              out.append("- **FAIL** — type errors below.")
+              out.append("```")
+              out.append(txt[-2500:])
+              out.append("```")
+
+          # --- eslint ----------------------------------------------------------------------
+          rc2, txt2 = run(["npx", "--no-install", "eslint", "."], 900)
+          err, warn = lint_counts(txt2)
+          berr, bwarn = BASE.get("eslint_errors"), BASE.get("eslint_warnings")
+          out.append("")
+          out.append("## eslint")
+          out.append(f"- baseline: **{berr} errors / {bwarn} warnings** (measured on the untouched tree at seed time)")
+          out.append(f"- delivered: **{err} errors / {warn} warnings**")
+          if None in (err, warn, berr, bwarn):
+              out.append("- **INCONCLUSIVE** — could not parse a count. Raw tail:")
+              out.append("```"); out.append(txt2[-1500:]); out.append("```")
+          else:
+              d_e, d_w = err - berr, warn - bwarn
+              out.append(f"- **DELTA: {d_e:+d} errors / {d_w:+d} warnings**")
+              out.append("- **PASS**" if (d_e <= 0 and d_w <= 0) else "- **FAIL** — this change adds lint.")
+              if d_e > 0 or d_w > 0:
+                  out.append("```"); out.append(txt2[-2000:]); out.append("```")
+
+          # --- build -----------------------------------------------------------------------
+          # Kept last: it is the slowest, and a failure here is worth knowing even if tsc/lint
+          # passed. The previous run shipped claiming "build green" while .next/trace-build
+          # recorded a failure — measuring it here removes the possibility of that claim.
+          rc3, txt3 = run(["npm", "run", "build"], 1800)
+          out.append("")
+          out.append("## npm run build")
+          out.append(f"- exit: **{rc3}**")
+          if rc3 == 0:
+              out.append("- **PASS**")
+          else:
+              out.append("- **FAIL** — tail below. Judge whether this is the change or the environment;")
+              out.append("  a turbopack/workspace-root complaint about the symlinked node_modules is")
+              out.append("  environmental, a type or import error is not.")
+              out.append("```"); out.append(txt3[-2500:]); out.append("```")
+
+          Path("COMPILE_RESULTS.md").write_text("\n".join(out) + "\n", encoding="utf-8")
+          print("\n".join(out[:14]))
+          print("...")
+          print("wrote COMPILE_RESULTS.md")
+          ```
+
+    - id: Compile_Executor
+      type: python
+      description: Runs the compile suite. Always exits 0 — a failing build is a FINDING for the gate, not a crash.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 3900
         encoding: utf-8
 
     # ── 4. GATE ─────────────────────────────────────────────────────────────────────────
@@ -442,7 +583,7 @@ graph:
       process: null
       dynamic: null
     - from: Patch_Executor
-      to: Gate
+      to: Compile_Script
       trigger: true
       condition: 'true'
       carry_data: true
@@ -559,6 +700,26 @@ graph:
       dynamic: null
     - from: Package_Executor
       to: Done
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Compile_Script
+      to: Compile_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Compile_Executor
+      to: Gate
       trigger: true
       condition: 'true'
       carry_data: true
