@@ -1,0 +1,576 @@
+graph:
+  id: kimi_next_phase
+  description: >-
+    THE REUSABLE KIMI DISPATCHER — runs whatever phase is currently queued, gates it with a
+    real compile, stops at Pac, and retires the brief on approval.
+
+    Route: Seed (deterministic clone + brief pickup) -> Kimi builds -> patch generation ->
+    Claude gates (tsc + eslint + scope) -> bounded repair -> PAC APPROVES -> package to
+    outbox AND archive the brief.
+
+    ⚠️ LAUNCH FROM THE CONSOLE (http://localhost:5173). `type: human` blocks properly only in
+    live WebSocket runs. And bookmark the URL once `&session=` appears — that is what lets
+    you refresh or reopen and still see the whole run.
+
+    HOW IT PICKS THE TASK — and why that enforces the law:
+    The seed globs `inbox/NEXT-*.md` and requires EXACTLY ONE match. Zero means nothing is
+    queued; more than one means two deliverables are competing, and it refuses rather than
+    guess. That makes "one deliverable owns the working tree" a structural property of the
+    dispatcher instead of a rule everyone has to remember. Park a brief by dropping the
+    `NEXT-` prefix (that is how EARTHSIDE sits in the inbox without blocking anything);
+    activate it by restoring the prefix.
+
+    It never touches ~/dev/onecocreation. It clones at whatever HEAD currently is, so the
+    working tree stays free for you the whole time it runs.
+  log_level: INFO
+  is_majority_voting: false
+  nodes:
+
+    # ── 1. SEED — deterministic. Clone, pick the brief, write the instructions. ──────────
+    - id: Seed_Script
+      type: literal
+      description: Fixed Python. Clones the repo at HEAD, picks the single queued brief, stages instructions.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import glob, os, shutil, subprocess, sys
+          from pathlib import Path
+
+          SRC   = Path("/home/pac/dev/onecocreation")
+          KIMI  = Path("/home/pac/dev/kimi")
+          REPO  = Path("repo")
+
+          def run(args, cwd=None, check=True):
+              r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+              if check and r.returncode != 0:
+                  print("CMD FAILED:", " ".join(args)); print(r.stderr[:600]); sys.exit(1)
+              return r
+
+          # --- pick the queued brief. Exactly one, or refuse. -------------------------------
+          briefs = sorted(glob.glob(str(KIMI / "inbox" / "NEXT-*.md")))
+          if len(briefs) == 0:
+              print("NOTHING QUEUED: no inbox/NEXT-*.md.")
+              print("Queue a phase by naming its brief NEXT-<something>.md in ~/dev/kimi/inbox/.")
+              sys.exit(1)
+          if len(briefs) > 1:
+              print("AMBIGUOUS QUEUE - refusing to guess. Found:")
+              for b in briefs: print("   ", Path(b).name)
+              print("ONE deliverable owns the tree. Park the others by dropping the NEXT- prefix.")
+              sys.exit(1)
+
+          brief = Path(briefs[0])
+          shutil.copy(brief, "TASK.md")
+          Path("BRIEF_NAME").write_text(brief.name, encoding="utf-8")
+          print("brief:", brief.name, Path("TASK.md").stat().st_size, "bytes")
+
+          # --- clone at current HEAD (shared objects; node_modules symlinked, never copied) --
+          if REPO.exists():
+              shutil.rmtree(REPO)
+          head = run(["git", "rev-parse", "HEAD"], cwd=SRC).stdout.strip()
+          run(["git", "clone", "--shared", "--quiet", str(SRC), str(REPO)])
+          run(["git", "checkout", "--quiet", head], cwd=REPO)
+          Path("BASELINE_SHA").write_text(head, encoding="utf-8")
+          print("cloned at", head[:12])
+
+          dirty = run(["git", "status", "--porcelain"], cwd=REPO).stdout.strip()
+          print("clone pristine:", "yes" if not dirty else "NO - unexpected")
+
+          link = REPO / "node_modules"
+          if not link.exists():
+              os.symlink(SRC / "node_modules", link)
+          print("node_modules symlinked:", link.is_dir())
+
+          # --- instructions ON DISK. Never routed through a model. --------------------------
+          # 0018.05.26: an 1881-char instruction relayed via a 30B choreography model arrived
+          # PARAPHRASED — the gate agent was effectively told "read these files" instead of
+          # "verify and write REVIEW.md", so it analysed correctly, wrote nothing, emitted no
+          # verdict, and the graph looped 5x at ~$0.45 a pass. Files are not paraphrasable.
+          Path("BUILD_INSTRUCTIONS.md").write_text('''# Builder instructions
+
+          Read `TASK.md` in this directory — it is your complete brief, written for you.
+          The repo is cloned at `./repo`, clean, at the commit recorded in `BASELINE_SHA`.
+          **Work only inside `./repo`.**
+
+          Carry out TASK.md in full. Obey its scope fences exactly: where it says stop and
+          ask, STOP rather than inventing an answer, and say so in your notes.
+
+          Do not reformat files, make no unrelated edits, and change as few lines as possible.
+
+          When done, write `FIX_NOTES.md` in the PARENT directory (not inside `repo/`):
+          what you built, how you met each requirement TASK.md sets, and — plainly — anything
+          you did NOT do and why. An explicit "not done" is worth more than a confident claim
+          that fails review.
+          '''.replace("\n          ", "\n"), encoding="utf-8")
+
+          Path("GATE_INSTRUCTIONS.md").write_text('''# Gate instructions
+
+          Read `TASK.md` (the brief the builder was given) and `FIX_NOTES.md` (their account)
+          in this directory. The edited repo is `./repo`; the patch is `./deliverable.patch`.
+
+          ⚠️ Your shell's working directory PERSISTS between Bash calls. Do not repeat
+          `cd repo` — `cd` once and stay, or use `git -C repo ...` and `repo/src/...` paths.
+
+          ## Verify against real file contents. Never trust FIX_NOTES.md.
+          Walk every requirement TASK.md states and check it yourself in the code. Judge
+          INTENT, not string matches: a pattern that looks wrong may be correct once you read
+          what the values actually are, and a pattern that looks fine may be wrong in context.
+          A requirement you could not verify is a FAIL, not a pass.
+
+          Pay particular attention to any copy the brief marks as verbatim or forbidden — the
+          exact wording matters, and forbidden claims are blockers.
+
+          ## Compile
+          From inside `repo/`:
+            npx --no-install tsc --noEmit
+            npx --no-install eslint . 2>&1 | tail -20
+          MEASURE the baseline yourself rather than trusting a quoted number: stash the
+          changes, run both on the pre-change tree, restore, and report the DELTA. Do not
+          leave anything stashed. tsc must be clean; an eslint delta of zero passes.
+
+          ## Scope-check
+          Read the patch. Flag any hunk that is not clearly required by TASK.md.
+
+          ## WRITE THE FILE — this is the deliverable, not your chat reply
+          Write `REVIEW.md` here: per-requirement PASS/FAIL with the evidence you actually
+          checked, the tsc result, the eslint delta, and any out-of-scope hunks.
+
+          Its LAST line must be exactly one of:
+          VERDICT: APPROVE
+          VERDICT: NEEDS_WORK
+
+          End your own reply with that same line and nothing after it.
+          '''.replace("\n          ", "\n"), encoding="utf-8")
+
+          print("instructions staged")
+          print("SEED OK")
+          ```
+
+    - id: Seed_Executor
+      type: python
+      description: Runs Seed_Script. Non-zero exit means nothing is queued, or two things are.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 300
+        encoding: utf-8
+
+    # ── 2. BUILD ────────────────────────────────────────────────────────────────────────
+    - id: Builder
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        role: |-
+          You are a dispatcher. You have exactly one tool and you make exactly one call.
+
+          Call `kimi_run` with:
+            task: "Read BUILD_INSTRUCTIONS.md in the current working directory and carry it out in full."
+            expect_files: true
+            timeout_seconds: 2400
+
+          Then reply in ONE sentence: whether ok was true, and which files changed. If ok was
+          false, say so plainly and quote the error — never report success the tool did not
+          report.
+
+          Do not do the work yourself. Do not read files. Do not run commands. You have no
+          tool other than `kimi_run`, and attempting any other tool will error.
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: kimi_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Delegates the phase to Kimi (curated skills pinned, external service).'
+      context_window: 4
+      log_output: true
+
+    # ── 3. PATCH — deterministic ────────────────────────────────────────────────────────
+    - id: Patch_Script
+      type: literal
+      description: Fixed Python. Turns Kimi's edits into the deliverable patch.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import subprocess, sys
+          from pathlib import Path
+
+          REPO = Path("repo")
+          OUT  = Path("deliverable.patch")
+
+          def run(a, cwd=None): return subprocess.run(a, cwd=cwd, capture_output=True, text=True)
+
+          status = run(["git", "status", "--porcelain"], cwd=REPO).stdout.strip()
+          if not status:
+              print("NO CHANGES - Kimi edited nothing in repo/. Nothing to package.")
+              sys.exit(1)
+
+          print("files touched:")
+          for line in status.splitlines(): print("  ", line)
+
+          untracked = run(["git", "ls-files", "--others", "--exclude-standard"], cwd=REPO).stdout.split()
+          if untracked:
+              # New files must be in the patch, or the deliverable is silently incomplete.
+              print("staging", len(untracked), "new file(s) so they land in the diff")
+              run(["git", "add", "-N"] + untracked, cwd=REPO)
+
+          diff = run(["git", "diff", "--patch"], cwd=REPO).stdout
+          OUT.write_text(diff, encoding="utf-8")
+          print("wrote", OUT, OUT.stat().st_size, "bytes")
+          print("PATCH OK")
+          ```
+
+    - id: Patch_Executor
+      type: python
+      description: Runs Patch_Script. Non-zero exit if Kimi changed nothing.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 180
+        encoding: utf-8
+
+    # ── 4. GATE ─────────────────────────────────────────────────────────────────────────
+    - id: Gate
+      type: agent
+      config:
+        name: ${NVIDIA_MODEL_NAME}
+        provider: openai
+        base_url: ${NVIDIA_BASE_URL}
+        api_key: ${NVIDIA_API_KEY}
+        role: |-
+          You are a dispatcher. You have exactly one tool and you make exactly one call.
+
+          Call `claude_run` with:
+            task: "Read GATE_INSTRUCTIONS.md in the current working directory and carry it out in full."
+            expect_files: true
+            timeout_seconds: 1800
+            allowed_tools: "Read,Write,Edit,Grep,Glob,Bash"
+
+          The tool returns a `final_text` ending in a verdict line. Reply with that verdict in
+          two or three sentences, and make your LAST line exactly one of:
+          VERDICT: APPROVE
+          VERDICT: NEEDS_WORK
+          Nothing may follow it — it is the routing keyword. If the tool returned ok: false,
+          or no verdict is present, emit VERDICT: NEEDS_WORK.
+
+          Do not verify anything yourself. Do not read files. Do not run commands. You have no
+          tool other than `claude_run`, and attempting any other tool will error.
+        params: {}
+        tooling:
+          - type: function
+            config:
+              auto_load: true
+              tools:
+                - name: claude_run
+        thinking: null
+        memories: []
+        retry: null
+      description: 'Claude compiles and verifies; emits the routing verdict.'
+      context_window: 6
+      log_output: true
+
+    - id: Repair_Loop_Counter
+      type: loop_counter
+      description: Caps Builder/Gate repair at 2. Each hop is a real subprocess.
+      context_window: 0
+      config:
+        max_iterations: 2
+        reset_on_emit: true
+        message: 'Repair cap reached (2 attempts) — going to Pac flagged NOT gate-clean rather than burning more crew calls.'
+
+    # ── 5. PAC RULES ────────────────────────────────────────────────────────────────────
+    - id: Pac_Approval
+      type: human
+      description: "Pac's gate before anything is packaged or retired."
+      context_window: 0
+      config:
+        description: |-
+          PHASE READY — your call, Captain.
+
+          Nothing has touched ~/dev/onecocreation. This ran entirely in its own clone; your
+          working tree is exactly as you left it.
+
+          In the run workspace: REVIEW.md (the gate), FIX_NOTES.md (Kimi's account),
+          deliverable.patch, and repo/ with the work applied — plus every crew member's full
+          session stream under _agent_logs/.
+
+          Reply APPROVE to package the patch to the outbox and retire the brief to the
+          archive, or REJECT (say why, so it lands in the notes). Anything else is treated as
+          REJECT — packaging and archiving only happen on an explicit APPROVE.
+
+    # ── 6. PACKAGE + ARCHIVE — deterministic, and only on APPROVE ───────────────────────
+    - id: Package_Script
+      type: literal
+      description: Fixed Python. Copies the deliverable to the outbox and retires the brief.
+      context_window: 0
+      config:
+        role: user
+        content: |-
+          ```python
+          import re, shutil, subprocess, sys
+          from pathlib import Path
+
+          KIMI  = Path("/home/pac/dev/kimi")
+          brief = Path("BRIEF_NAME").read_text(encoding="utf-8").strip()
+
+          # Derive the task id from the brief name: NEXT-P3-binding-blocks.md -> task-04-p3
+          # is NOT inferable, so use the brief's own stem. Deterministic and readable.
+          stem = re.sub(r"^NEXT-", "", brief).removesuffix(".md")
+          dest = KIMI / "outbox" / stem
+          dest.mkdir(parents=True, exist_ok=True)
+
+          for name, target in (("deliverable.patch", f"{stem}.patch"),
+                               ("REVIEW.md", "GATE-REVIEW.md"),
+                               ("FIX_NOTES.md", "FIX-NOTES.md"),
+                               ("TASK.md", "BRIEF.md")):
+              src = Path(name)
+              if src.is_file():
+                  shutil.copy(src, dest / target)
+                  print("packaged:", target)
+
+          # Retire the brief so a later dispatch cannot pick up finished work and redo it.
+          # This is the whole point of running it HERE: after the gate passed AND Pac
+          # approved. The builder never gets to retire its own brief.
+          script = KIMI / "archive-task.sh"
+          if script.is_file():
+              r = subprocess.run([str(script), stem, "--note",
+                                  "Approved at the crew console human gate."],
+                                 capture_output=True, text=True)
+              print(r.stdout or r.stderr[:400])
+          else:
+              # Fall back to moving just the brief; never leave it live in the inbox.
+              src = KIMI / "inbox" / brief
+              if src.is_file():
+                  adest = KIMI / "archive" / stem / "briefs"
+                  adest.mkdir(parents=True, exist_ok=True)
+                  shutil.move(str(src), str(adest / brief))
+                  print("archived brief (fallback):", brief)
+
+          live = sorted(p.name for p in (KIMI / "inbox").glob("NEXT-*.md"))
+          print("queue after archive — active briefs:", live or "none")
+          print("PACKAGE OK")
+          ```
+
+    - id: Package_Executor
+      type: python
+      description: Runs Package_Script — outbox copy + brief retirement. Only reached on APPROVE.
+      context_window: 0
+      log_output: true
+      config:
+        args: []
+        env: {}
+        timeout_seconds: 180
+        encoding: utf-8
+
+    - id: Rejected
+      type: literal
+      description: Terminal — Pac rejected; nothing packaged, brief stays live.
+      context_window: 0
+      config:
+        role: assistant
+        content: >-
+          Rejected. Nothing was packaged and the brief stays in the inbox, still active. The
+          run workspace is intact for inspection — REVIEW.md, FIX_NOTES.md, deliverable.patch
+          and repo/ are all still there, along with every agent's session stream in
+          _agent_logs/.
+
+    - id: Done
+      type: literal
+      description: Terminal — packaged and archived.
+      context_window: 0
+      config:
+        role: assistant
+        content: >-
+          Phase closed. The patch, the gate review, the fix notes and the original brief are
+          in the outbox under the brief's own name, and the brief has been retired from the
+          inbox to the archive so it cannot be re-dispatched. Generated code stays UNTRUSTED
+          until it is applied and committed by hand — the queue being clean is not the same
+          as the work being merged.
+
+  edges:
+    - from: Seed_Script
+      to: Seed_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Seed_Executor
+      to: Builder
+      trigger: true
+      condition: 'true'
+      carry_data: false
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Builder
+      to: Patch_Script
+      trigger: true
+      condition: 'true'
+      carry_data: false
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Patch_Script
+      to: Patch_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Patch_Executor
+      to: Gate
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Gate
+      to: Pac_Approval
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: APPROVE'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Gate
+      to: Builder
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: NEEDS_WORK'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Gate
+      to: Repair_Loop_Counter
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'VERDICT: NEEDS_WORK'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Repair_Loop_Counter
+      to: Pac_Approval
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    # APPROVE -> package + archive. Anything else -> rejected, brief stays live.
+    - from: Pac_Approval
+      to: Package_Script
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'APPROVE'
+          none: []
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Pac_Approval
+      to: Rejected
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any: []
+          none:
+            - 'APPROVE'
+          regex: []
+          case_sensitive: false
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Package_Script
+      to: Package_Executor
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Package_Executor
+      to: Done
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+  start:
+    - Seed_Script
+  end:
+    - Done
+    - Rejected
+version: 1.0.0
+vars: {}
