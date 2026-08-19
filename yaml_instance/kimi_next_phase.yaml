@@ -510,7 +510,11 @@ graph:
           # approved. The builder never gets to retire its own brief.
           script = KIMI / "archive-task.sh"
           if script.is_file():
-              r = subprocess.run([str(script), stem, "--note",
+              # Pass the brief name explicitly. A brief and its deliverable do NOT reliably
+              # share a name — P3 shipped as `task-04-p3` from `NEXT-P3-binding-blocks.md`,
+              # and an id-only match archived the patches while leaving the brief LIVE, which
+              # would have had the dispatcher rebuild work that had just been committed.
+              r = subprocess.run([str(script), stem, "--brief", brief, "--note",
                                   "Approved at the crew console human gate."],
                                  capture_output=True, text=True)
               print(r.stdout or r.stderr[:400])
