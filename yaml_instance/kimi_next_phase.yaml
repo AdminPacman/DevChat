@@ -60,6 +60,21 @@ graph:
               print("ONE deliverable owns the tree. Park the others by dropping the NEXT- prefix.")
               sys.exit(1)
 
+          # --- clear artifacts from any PRIOR run in this workspace. ------------------------
+          # DevChat reuses a workspace when the browser reconnects to the same session id, so
+          # a re-launch can start with the previous run's deliverable.patch, REVIEW.md,
+          # COMPILE_RESULTS.md and FIX_NOTES.md still lying around. Normally they get
+          # overwritten in the ordinary flow — but if a run dies partway, the gate would read
+          # a STALE review and verdict as though it were this run's. Wipe them at the door:
+          # the only trustworthy artifact is one this run produced.
+          stale = ["deliverable.patch", "REVIEW.md", "FIX_NOTES.md", "COMPILE_RESULTS.md",
+                   "BASELINE_COMPILE.json", "TASK.md", "BRIEF_NAME", "BASELINE_SHA"]
+          cleared = [f for f in stale if Path(f).exists()]
+          for f in cleared:
+              Path(f).unlink()
+          if cleared:
+              print("cleared stale artifacts from a prior run:", ", ".join(cleared))
+
           brief = Path(briefs[0])
           shutil.copy(brief, "TASK.md")
           Path("BRIEF_NAME").write_text(brief.name, encoding="utf-8")
