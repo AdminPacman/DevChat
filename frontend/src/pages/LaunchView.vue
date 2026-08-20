@@ -315,7 +315,11 @@
         </div>
 
         <div v-show="viewMode === 'graph'" class="graph-panel">
-          <VueFlow class="vueflow-graph" @node-drag-stop="onNodeDragStop">
+          <VueFlow
+            class="vueflow-graph"
+            :snap-to-grid="true"
+            :snap-grid="[20, 20]"
+            @node-drag-stop="onNodeDragStop">
             <template #node-workflow-node="props">
               <WorkflowNode
                 :id="props.id"
@@ -503,6 +507,7 @@ import { useI18n } from 'vue-i18n'
 import { fetchWorkflowsWithDesc, fetchLogsZip, fetchWorkflowYAML, postFile, getAttachment, fetchVueGraphLayout, postVueGraphLayout, fetchAgentTail } from '../utils/apiFunctions.js'
 import { configStore } from '../utils/configStore.js'
 import { spriteFetcher } from '../utils/spriteFetcher.js'
+import { bindGraph } from '../utils/crewIdentity.js'
 import yaml from 'js-yaml'
 import MarkdownIt from 'markdown-it'
 import SettingsModal from '../components/SettingsModal.vue'
@@ -1868,6 +1873,12 @@ const generateNodesAndEdges = async ({ fit = false } = {}) => {
     const yamlEdges = Array.isArray(workflowYaml.value?.graph?.edges)
       ? workflowYaml.value.graph.edges
       : []
+
+    // Cast the crew before anything renders. Named crew (Kimi, Claude, pi, PAC)
+    // always keep their own face; generic agents are assigned distinct sprites
+    // across the whole graph, which per-node hashing could not guarantee — with
+    // a nine-sprite pool two agents collided about half the time.
+    bindGraph(yamlNodes)
 
     const generatedNodes = yamlNodes.map((node, index) => ({
       id: node.id,
