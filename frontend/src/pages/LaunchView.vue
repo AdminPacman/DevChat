@@ -675,6 +675,91 @@ const addLoadingEntry = (nodeId, baseKey, label) => {
   return entry
 }
 
+// ── "It's your turn" ────────────────────────────────────────────────────────
+// A run blocking on a human node used to announce itself with a CSS pulse on the
+// input box and nothing else — no title change, no notification, no sound. If the
+// tab wasn't in front of you, nothing told you you were being waited on. That
+// matters more than it sounds: human nodes TIME OUT AT 1800 SECONDS, so walking
+// away from an unnoticed prompt does not pause the run, it kills it.
+const YOUR_TURN_PREFIX = '🔴 YOUR TURN — '
+let baseTitle = typeof document !== 'undefined' ? document.title : ''
+let notificationPermissionAsked = false
+
+// Asked on the launch click — a user gesture — never on page load. Browsers treat
+// unprompted permission requests as hostile, and so should we.
+const primeNotifications = () => {
+  if (notificationPermissionAsked) return
+  notificationPermissionAsked = true
+  try {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {})
+    }
+  } catch {
+    // No Notification API (older browser, insecure origin). Title flash and sound
+    // still work, so degrade quietly rather than breaking the launch.
+  }
+}
+
+// A short two-tone chime, synthesized rather than shipped: no asset to fetch,
+// nothing to 404, and it cannot be confused with the rig's other sounds.
+const playTurnChime = () => {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext
+    if (!Ctx) return
+    const ctx = new Ctx()
+    const now = ctx.currentTime
+    ;[880, 1320].forEach((freq, i) => {
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.type = 'sine'
+      osc.frequency.value = freq
+      gain.gain.setValueAtTime(0.0001, now + i * 0.16)
+      gain.gain.exponentialRampToValueAtTime(0.16, now + i * 0.16 + 0.02)
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.16 + 0.34)
+      osc.connect(gain).connect(ctx.destination)
+      osc.start(now + i * 0.16)
+      osc.stop(now + i * 0.16 + 0.36)
+    })
+    setTimeout(() => { try { ctx.close() } catch { /* already closed */ } }, 1200)
+  } catch {
+    // Audio blocked until a user gesture, or unavailable. The title and the
+    // notification carry the message; not worth surfacing.
+  }
+}
+
+const announceYourTurn = (nodeId, taskDescription) => {
+  // The title flash is the most reliable channel: no permission needed, works in a
+  // background tab, visible in the tab strip and the taskbar.
+  try {
+    if (!document.title.startsWith(YOUR_TURN_PREFIX)) {
+      baseTitle = document.title
+    }
+    document.title = `${YOUR_TURN_PREFIX}${nodeId || 'decision needed'}`
+  } catch { /* non-browser context */ }
+
+  try {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      const body = (taskDescription || '').trim().slice(0, 180) || 'A run is waiting on your decision.'
+      const note = new Notification(`Your turn — ${nodeId || 'DevChat'}`, {
+        body,
+        tag: 'devchat-human-gate',  // replaces rather than stacks across prompts
+        requireInteraction: true     // a decision request should not fade on its own
+      })
+      note.onclick = () => { try { window.focus(); note.close() } catch { /* ignore */ } }
+    }
+  } catch { /* notification construction throws on some platforms */ }
+
+  playTurnChime()
+}
+
+const clearYourTurn = () => {
+  try {
+    if (baseTitle && document.title.startsWith(YOUR_TURN_PREFIX)) {
+      document.title = baseTitle
+    }
+  } catch { /* non-browser context */ }
+}
+
 // ── Live agent tail ─────────────────────────────────────────────────────────
 // Fleet calls (kimi_run / claude_run / pi_run) are long and, until now, totally
 // silent: the WebSocket emits nothing between a tool call's start and its finish
@@ -1492,6 +1577,9 @@ const sendHumanInput = () => {
     return
   }
 
+  // The operator has answered — take the tab title back.
+  clearYourTurn()
+
   const trimmedInput = taskPrompt.value.trim()
   const attachmentIds = uploadedAttachments.value.map((attachment) => attachment.attachmentId)
   const attachmentNames = uploadedAttachments.value.map(
@@ -1701,6 +1789,7 @@ onUnmounted(() => {
 
   stopLoadingTimer()
   stopAllAgentTails()
+  clearYourTurn()
   runningLoadingEntries.value = 0
 })
 
@@ -1911,6 +2000,11 @@ const launchWorkflow = async () => {
     alert(t('launch.alert_choose_workflow'))
     return
   }
+
+  // Ask for notification permission HERE — inside the click that starts a run.
+  // This is the moment the operator has declared they care about the outcome, and
+  // it is a real user gesture, which is what browsers require.
+  primeNotifications()
 
   const trimmedPrompt = taskPrompt.value.trim()
   const attachmentIds = uploadedAttachments.value.map((attachment) => attachment.attachmentId)
@@ -2236,6 +2330,8 @@ const processMessage = async (msg) => {
 
     status.value = "Waiting for input..."
     shouldGlow.value = true
+    // Reach the operator even when this tab is not in front of them.
+    announceYourTurn(msg.data.node_id, msg.data.task_description)
   }
 
   // Handle artifact messages (file/image output)
@@ -2389,6 +2485,9 @@ const processMessage = async (msg) => {
     status.value = 'Completed'
     isWorkflowRunning.value = false
     sessionIdToDownload = sessionId
+    // The run is over — a stale "YOUR TURN" in the tab title would be a lie.
+    clearYourTurn()
+    stopAllAgentTails()
   }
 
   // Workflow cancelled (e.g., from server-side cancellation)
@@ -2397,6 +2496,8 @@ const processMessage = async (msg) => {
     status.value = 'Cancelled'
     isWorkflowRunning.value = false
     sessionIdToDownload = sessionId
+    clearYourTurn()
+    stopAllAgentTails()
   }
 
   // Handle direct error messages (e.g., workflow execution errors)
@@ -2406,6 +2507,8 @@ const processMessage = async (msg) => {
     status.value = 'Error'
     isWorkflowRunning.value = false
     sessionIdToDownload = sessionId
+    clearYourTurn()
+    stopAllAgentTails()
   }
 }
 
