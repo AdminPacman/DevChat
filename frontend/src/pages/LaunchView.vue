@@ -508,6 +508,7 @@ import { fetchWorkflowsWithDesc, fetchLogsZip, fetchWorkflowYAML, postFile, getA
 import { configStore } from '../utils/configStore.js'
 import { spriteFetcher } from '../utils/spriteFetcher.js'
 import { bindGraph } from '../utils/crewIdentity.js'
+import { returnPathKeys } from '../utils/graphLayering.js'
 import yaml from 'js-yaml'
 import MarkdownIt from 'markdown-it'
 import SettingsModal from '../components/SettingsModal.vue'
@@ -1891,20 +1892,36 @@ const generateNodesAndEdges = async ({ fit = false } = {}) => {
       data: node
     }))
 
-    const generatedEdges = yamlEdges.map(edge => ({
-      id: `${edge.from}-${edge.to}`,
-      source: edge.from,
-      target: edge.to,
-      type: 'workflow-edge',
-      markerEnd: {
-        type: MarkerType.Arrow,
-        width: 18,
-        height: 18,
-        color: '#f2f2f2',
-        strokeWidth: 2,
-      },
-      data: edge
-    }))
+    // Which edges close a cycle — i.e. which are repair-loop RETURN PATHS
+    // rather than forward flow. Computed from topology once per graph so the
+    // canvas can draw them as deliberate return arcs, and so the marking stays
+    // correct after a node is dragged (a geometric "does it point left?" test
+    // would not).
+    const returnPaths = returnPathKeys(
+      yamlNodes,
+      yamlEdges,
+      Array.isArray(workflowYaml.value?.graph?.start) ? workflowYaml.value.graph.start : []
+    )
+
+    const generatedEdges = yamlEdges.map(edge => {
+      const isReturnPath = returnPaths.has(`${edge.from}->${edge.to}`)
+      return {
+        id: `${edge.from}-${edge.to}`,
+        source: edge.from,
+        target: edge.to,
+        type: 'workflow-edge',
+        markerEnd: {
+          type: MarkerType.Arrow,
+          width: 18,
+          height: 18,
+          // Match the arrowhead to the stroke, or a rose return path ends in a
+          // white arrowhead and reads as two edges spliced together.
+          color: isReturnPath ? '#c08497' : '#f2f2f2',
+          strokeWidth: 2,
+        },
+        data: { ...edge, isReturnPath }
+      }
+    })
 
     setNodes(generatedNodes)
     setEdges(generatedEdges)

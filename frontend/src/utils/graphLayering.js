@@ -122,6 +122,42 @@ export function breakCycles(ids, successors, roots = []) {
 }
 
 /**
+ * The set of edges that close a cycle, as `"from->to"` keys.
+ *
+ * Used to mark return paths on the canvas. Deliberately derived from TOPOLOGY
+ * rather than from geometry ("does this edge currently point leftward?"): the
+ * topology is the truth about what the edge means, and it stays true after
+ * somebody hand-drags a node across the canvas. Geometry is only a fallback.
+ *
+ * @param {Array} nodes  raw YAML nodes (needs `.id`)
+ * @param {Array} edges  raw YAML edges (needs `.from` / `.to`)
+ * @param {string[]} [roots]
+ * @returns {Set<string>} keys of the form `from->to`
+ */
+export function returnPathKeys(nodes, edges, roots = []) {
+  const ids = (nodes || []).map(n => n?.id).filter(Boolean)
+  if (!ids.length) return new Set()
+
+  const successors = new Map(ids.map(id => [id, new Set()]))
+  for (const edge of edges || []) {
+    if (!edge?.from || !edge?.to) continue
+    if (!successors.has(edge.from) || !successors.has(edge.to)) continue
+    // A self-loop is a return path by definition and DFS never colours it grey
+    // against itself, so name it here rather than relying on the search.
+    successors.get(edge.from).add(edge.to)
+  }
+
+  const { backEdges } = breakCycles(ids, successors, roots)
+  const keys = new Set(backEdges.map(([from, to]) => `${from}->${to}`))
+
+  for (const edge of edges || []) {
+    if (edge?.from && edge.from === edge.to) keys.add(`${edge.from}->${edge.to}`)
+  }
+
+  return keys
+}
+
+/**
  * Assign every node a level using longest-path layering on the acyclic graph.
  *
  * Longest-path (rather than Kahn's "first time we reach it") is what makes an

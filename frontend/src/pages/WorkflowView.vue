@@ -343,7 +343,7 @@ import yaml from 'js-yaml'
 import { fetchYaml, fetchVueGraphLayout, postVueGraphLayout, updateYaml, postYamlNameChange, postYamlCopy } from '../utils/apiFunctions'
 import { helpContent } from '../utils/helpContent.js'
 import { configStore } from '../utils/configStore.js'
-import { assignLevels } from '../utils/graphLayering.js'
+import { assignLevels, returnPathKeys } from '../utils/graphLayering.js'
 import { bindGraph } from '../utils/crewIdentity.js'
 import { orderLayers } from '../utils/layerOrdering.js'
 
@@ -1056,9 +1056,19 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
         nodes.value = nextNodes
       }
 
+    // Which edges close a cycle — the repair-loop RETURN PATHS. Derived from
+    // topology, not from geometry, so the marking survives hand-dragging and is
+    // still right when a saved layout is restored instead of auto-laid-out.
+    const returnPaths = returnPathKeys(
+      yamlNodes,
+      yamlEdges,
+      Array.isArray(yamlContent.value?.graph?.start) ? yamlContent.value.graph.start : []
+    )
+
     // Build edges from YAML (preserve layout where possible)
     const nextYamlEdges = yamlEdges.map(yamlEdge => {
       const key = `${yamlEdge.from}-${yamlEdge.to}`
+      const isReturnPath = returnPaths.has(`${yamlEdge.from}->${yamlEdge.to}`)
       const baseEdge = preserveExistingLayout && existingEdgeByKey?.has(key)
         ? existingEdgeByKey.get(key)
         : {
@@ -1073,13 +1083,16 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
         id: key,
         source: yamlEdge.from,
         target: yamlEdge.to,
-        data: yamlEdge,
+        data: { ...yamlEdge, isReturnPath },
         markerEnd: {
           type: MarkerType.Arrow,
           width: 16,
           height: 16,
-          // Set color to match with edge
-          color: (yamlEdge && yamlEdge.trigger === false) ? '#868686' : '#f2f2f2',
+          // Set color to match with edge. "Did not fire" (grey) outranks "goes
+          // back" (rose) — an edge that never triggered is the more urgent fact.
+          color: (yamlEdge && yamlEdge.trigger === false)
+            ? '#868686'
+            : (isReturnPath ? '#c08497' : '#f2f2f2'),
           strokeWidth: 1.5,
         },
       }

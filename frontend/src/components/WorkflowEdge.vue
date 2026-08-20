@@ -98,6 +98,29 @@ const edgeMarkerEnd = computed(() => {
   return base
 })
 
+/**
+ * Is this edge a RETURN PATH — the retry arc of a repair loop — rather than
+ * forward flow?
+ *
+ * Prefers the topological answer stamped by the graph layer
+ * (`data.isReturnPath`), because that is what the edge MEANS and it stays true
+ * after somebody hand-drags a node. Geometry is only the fallback, for edges on
+ * a hand-built or partially-loaded graph that nothing has stamped yet.
+ */
+const isReturnPath = computed(() => {
+  if (typeof props.data?.isReturnPath === 'boolean') return props.data.isReturnPath
+  return props.source === props.target || props.targetX < props.sourceX
+})
+
+/**
+ * The return path's own colour: a muted rose, deliberately outside the crew
+ * palette (Kimi amber / Claude cyan / pi teal / PAC red) because a return path
+ * belongs to no crew member — it is control flow. Distinct from the grey used
+ * for non-triggering edges, which is a different statement entirely: "this edge
+ * did not fire" versus "this edge goes back".
+ */
+const RETURN_PATH_STROKE = '#c08497'
+
 const edgeStyle = computed(() => {
   const baseStyle = {
     stroke: '#f2f2f2',
@@ -133,6 +156,21 @@ const edgeStyle = computed(() => {
       stroke: '#868686',
       strokeDasharray: '5, 5',
       animation: 'none',
+    }
+  }
+
+  // A deliberate return path, drawn as one. The long dash travels BACKWARDS
+  // along the arc (see `wf-edge-return-travel` in the UNSCOPED style block at
+  // the foot of this file), so the direction of travel is legible at a glance
+  // without reading the arrowhead — which on a wide arc is often off-screen or
+  // tucked behind a node.
+  if (isReturnPath.value) {
+    return {
+      ...baseStyle,
+      stroke: RETURN_PATH_STROKE,
+      strokeWidth: 1.1,
+      strokeDasharray: '10, 6',
+      strokeOpacity: 0.85,
     }
   }
 
@@ -646,6 +684,7 @@ const shouldShowTooltip = computed(() => configStore.ENABLE_HELP_TOOLTIPS)
     :path="edgePath"
     :marker-end="edgeMarkerEnd"
     :style="edgeStyle"
+    :class="{ 'wf-return-path': isReturnPath }"
     :animated=false
   />
   <!-- Animated overlay edge (on top of base) -->
@@ -690,6 +729,9 @@ const shouldShowTooltip = computed(() => configStore.ENABLE_HELP_TOOLTIPS)
   to { stroke-dashoffset: -20; }
 }
 
+/* NOTE: the return-path animation deliberately lives in the UNSCOPED style
+   block below, not here. See the comment there — a scoped rule cannot reach it. */
+
 @keyframes edge-glow {
   0%, 100% { stroke-opacity: 1; }
   50% { stroke-opacity: 0.65; }
@@ -717,5 +759,41 @@ const shouldShowTooltip = computed(() => configStore.ENABLE_HELP_TOOLTIPS)
 
 .edge-tooltip-trigger:hover {
   background-color: rgba(255, 255, 255, 0.1);
+}
+</style>
+
+<!--
+  UNSCOPED on purpose — this rule cannot work any other way.
+
+  `BaseEdge` renders the <path> as its own root, and Vue does not stamp this
+  component's `data-v-*` scope attribute onto it. A scoped rule therefore
+  compiles to `.wf-return-path[data-v-c4cb946a]` and matches NOTHING: verified in
+  the live DOM, where the class was present, the rule existed, and
+  `getComputedStyle(path).animationName` still came back `none`. The dash sat
+  there frozen and looked deliberate.
+
+  The class is namespaced `wf-` precisely because this block is global.
+-->
+<style>
+/* Return paths travel BACKWARDS. Forward flow animates stroke-dashoffset
+   negative; this goes positive, so the dashes visibly run against the arc's
+   direction. On a wide repair loop the arrowhead is often tucked behind a node
+   or off-canvas, so the motion — not the marker — is what tells you at a glance
+   that this edge returns to an earlier step.
+
+   Slow on purpose (2s). This canvas gets watched for long stretches, and a brisk
+   crawl becomes something an operator learns to tune out. */
+@keyframes wf-edge-return-travel {
+  to { stroke-dashoffset: 32; }
+}
+
+.vue-flow__edge path.wf-return-path {
+  animation: wf-edge-return-travel 2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vue-flow__edge path.wf-return-path {
+    animation: none;
+  }
 }
 </style>
