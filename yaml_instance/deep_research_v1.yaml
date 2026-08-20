@@ -355,6 +355,29 @@ graph:
         retry: null
       description: ''
       context_window: 0
+    # --- house addition 0018.05.25 a₿: bound the two unbounded review cycles (Job 2, devchat
+    # build agent). Quality Reviewer <-> Report Writer (per-chapter fix loop) and Quality Reviewer
+    # <-> Planner (per-chapter "next chapter" loop) both only exit on the LLM emitting the right
+    # ROUTE:/FINISHED keyword — nothing stops either cycle grinding local-Ollama inference short of
+    # the engine's own 100-iteration-per-cycle hard backstop (workflow/cycle_manager.py
+    # CycleInfo.max_iterations_default). These run in PARALLEL with the existing keyword-routed
+    # edges, not instead of them — the semantic exit still wins first if the model gets there.
+    - id: Writer_Revision_Loop_Counter
+      type: loop_counter
+      description: Caps how many times one chapter can bounce back to Report Writer before forcing the report onward.
+      context_window: 0
+      config:
+        max_iterations: 3
+        reset_on_emit: true
+        message: 'Chapter revision cap reached (3 attempts) — moving on rather than grinding one chapter forever.'
+    - id: Chapter_Loop_Counter
+      type: loop_counter
+      description: Caps the overall Planner chapter-by-chapter cycle in case Planner never emits FINISHED.
+      context_window: 0
+      config:
+        max_iterations: 10
+        reset_on_emit: true
+        message: 'Chapter-planning cap reached (10 passes) — forcing structure/export rather than an open-ended chapter loop.'
   edges:
     - from: START
       to: Demand Analyst
@@ -494,6 +517,61 @@ graph:
           none: []
           regex: []
           case_sensitive: true
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    # --- house addition 0018.05.25 a₿: loop_counter taps, parallel to the two edges above ---
+    - from: Quality Reviewer
+      to: Writer_Revision_Loop_Counter
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Report Writer'
+          none: []
+          regex: []
+          case_sensitive: true
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Writer_Revision_Loop_Counter
+      to: Planner
+      trigger: true
+      condition: 'true'
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Quality Reviewer
+      to: Chapter_Loop_Counter
+      trigger: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Planner'
+          none: []
+          regex: []
+          case_sensitive: true
+      carry_data: true
+      keep_message: false
+      clear_context: false
+      clear_kept_context: false
+      process: null
+      dynamic: null
+    - from: Chapter_Loop_Counter
+      to: Structure Organizer
+      trigger: true
+      condition: 'true'
       carry_data: true
       keep_message: false
       clear_context: false

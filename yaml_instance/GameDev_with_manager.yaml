@@ -740,6 +740,28 @@ graph:
       description: ''
       context_window: 6
       log_output: true
+    # --- house addition 0018.05.25 a₿: bound the crash-repair cycle (Job 2, devchat build agent) ---
+    # Final_Game_Executor <-> Bug_Fixer <-> Game_Launcher had no author-set exit besides "code stops
+    # failing" — an LLM that can't fix a crash would ping-pong here until the engine's own hard
+    # backstop (workflow/cycle_manager.py CycleInfo.max_iterations_default = 100, undocumented
+    # elsewhere) finally kills it. 100 rounds of local-Ollama inference is a grind-till-morning
+    # hazard for an unattended overnight run. max_iterations: 5 mirrors ChatDev_v1.yaml's "Test
+    # Modification Phase Loop Counter" (also a repair-retry cycle, also capped at 5).
+    - id: Bug_Fix_Loop_Counter
+      type: loop_counter
+      description: Caps the crash-repair cycle at 5 attempts so a stubborn bug can't grind the run overnight.
+      context_window: 0
+      config:
+        max_iterations: 5
+        reset_on_emit: true
+        message: 'Bug-fix cap reached (5 attempts) — releasing the build as-is. A human must review the remaining crash before this game ships (see DEVCHAT-WORKFLOW.md gold-in-gold-out gate).'
+    - id: Bug_Fix_Cap_Reached
+      type: literal
+      description: Terminal node reached only when Bug_Fix_Loop_Counter releases its cap message.
+      context_window: 0
+      config:
+        content: Bug-fix attempts exhausted (5/5). Build handed to outbox/review as-is; do not treat this as a passing run.
+        role: assistant
   edges:
     - from: Game Designer
       to: Planner
@@ -761,6 +783,15 @@ graph:
       to: Game_Launcher
       trigger: true
       carry_data: false
+    - from: Bug_Fixer
+      to: Bug_Fix_Loop_Counter
+      trigger: true
+      carry_data: true
+    - from: Bug_Fix_Loop_Counter
+      to: Bug_Fix_Cap_Reached
+      trigger: true
+      condition: 'true'
+      carry_data: true
     - from: QA_Agent
       to: Polish_Refinement
       trigger: true
@@ -900,6 +931,7 @@ graph:
     - Game Designer
   end:
     - Final_Game_Executor
+    - Bug_Fix_Cap_Reached
 version: 1.0.0
 vars: {}
 
