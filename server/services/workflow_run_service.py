@@ -50,6 +50,30 @@ class WorkflowRunService:
             except Exception as exc:
                 self.logger.warning("Failed to propagate cancellation to executor for %s: %s", session_id, exc)
 
+        # Reach any fleet subprocess ALREADY RUNNING. Setting cancel_event is not
+        # enough on its own: it is checked before a node's tool loop, never inside
+        # run_agent's wait — so a kimi_run/claude_run already in flight carried on
+        # for up to its full timeout. Up to 900 seconds of a Cancel button that
+        # looked like it worked and did nothing.
+        #
+        # Killing the process GROUP matters as much as killing at all: an agent CLI
+        # spawns its own children, and reaping only the launcher leaves them running
+        # and still billing.
+        try:
+            from server.settings import WARE_HOUSE_DIR
+            from functions.function_calling._fleet_common import cancel_agents_under
+
+            killed = cancel_agents_under(WARE_HOUSE_DIR / f"session_{session_id}")
+            if killed:
+                self.logger.info(
+                    "Cancellation killed %s live fleet agent(s) for session %s",
+                    killed,
+                    session_id,
+                )
+        except Exception as exc:
+            # Never let this stop the rest of cancellation from completing.
+            self.logger.warning("Failed to stop fleet agents for %s: %s", session_id, exc)
+
         self.session_store.update_session_status(session_id, SessionStatus.CANCELLED, error_message=cancel_message)
         return True
 

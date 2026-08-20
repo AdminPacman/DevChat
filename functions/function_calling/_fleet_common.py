@@ -48,8 +48,10 @@ import re
 import signal
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 # Hard cap on any text we hand back into graph context. Node context windows are small
 # (a local 4B model at 16k ctx is ~64 KB of text TOTAL for system + history + tools), so a
@@ -375,6 +377,120 @@ def _kill_process_group(proc: "subprocess.Popen[str]") -> None:
         pass
 
 
+# ── Cancellation ────────────────────────────────────────────────────────────
+#
+# THE PROBLEM THIS SOLVES. Cancel used to be a lie for fleet nodes. Pressing it set
+# `session.cancel_event`, which is checked by `_ensure_not_cancelled()` BEFORE a
+# node's tool loop — but never inside `run_agent`'s blocking `proc.wait()`. So once
+# kimi_run or claude_run had started, Cancel did NOTHING until the child exited on
+# its own or hit its timeout: up to 900 seconds of a button that appeared to work.
+# That is the same class of dishonesty as an `ok: true` that did no work.
+#
+# The graph runs on a worker thread while cancel arrives on the event loop, so the
+# registry is lock-guarded. Keyed by workspace because that is the only identifier
+# `run_agent` already has, and every session's agents run under its own session dir.
+_LIVE_AGENTS: Dict[int, Tuple["subprocess.Popen[str]", Path, str]] = {}
+_CANCELLED_ROOTS: Set[str] = set()
+_AGENTS_LOCK = threading.Lock()
+_agent_token_seq = 0
+
+
+def _register_agent(proc: "subprocess.Popen[str]", workspace: Path, label: str) -> int:
+    global _agent_token_seq
+    with _AGENTS_LOCK:
+        _agent_token_seq += 1
+        token = _agent_token_seq
+        _LIVE_AGENTS[token] = (proc, workspace, label)
+    return token
+
+
+def _unregister_agent(token: int) -> None:
+    with _AGENTS_LOCK:
+        _LIVE_AGENTS.pop(token, None)
+
+
+def _is_under(child: Path, root: Path) -> bool:
+    try:
+        child.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _cancel_requested_for(workspace: Path) -> bool:
+    """True when a cancel landed for a root containing this workspace."""
+    with _AGENTS_LOCK:
+        roots = list(_CANCELLED_ROOTS)
+    return any(_is_under(workspace, Path(r)) for r in roots)
+
+
+def cancel_agents_under(root: Path) -> int:
+    """Kill every live fleet agent running under `root`. Returns how many were hit.
+
+    Also remembers the root, so an agent that is spawned in the narrow window
+    between the cancel arriving and the subprocess starting is stopped by its own
+    first poll rather than running to completion. Nothing clears that memory during
+    a run — a cancelled run stays cancelled.
+
+    Safe to call from the event loop while the graph blocks on a worker thread: it
+    only takes the lock and signals process groups.
+    """
+    root = Path(root)
+    with _AGENTS_LOCK:
+        _CANCELLED_ROOTS.add(str(root))
+        targets = [
+            (token, proc, label)
+            for token, (proc, workspace, label) in _LIVE_AGENTS.items()
+            if _is_under(workspace, root)
+        ]
+
+    for _token, proc, _label in targets:
+        try:
+            _kill_process_group(proc)
+        except Exception:
+            # Best effort: a child that already exited raises, and that is a success
+            # from the caller's point of view.
+            pass
+    return len(targets)
+
+
+def clear_cancel_for(root: Path) -> None:
+    """Forget a cancelled root so a fresh run in the same workspace can proceed."""
+    with _AGENTS_LOCK:
+        _CANCELLED_ROOTS.discard(str(Path(root)))
+
+
+def _wait_with_cancel(
+    proc: "subprocess.Popen[str]",
+    workspace: Path,
+    timeout_seconds: int,
+) -> Tuple[bool, bool]:
+    """Wait for the child, honouring both the timeout and a cancel.
+
+    Returns (timed_out, cancelled). Polls rather than blocking outright — a blocking
+    wait is exactly what made Cancel inert.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            proc.wait(timeout=0.5)
+            # The child is gone — but WHY matters. `cancel_agents_under` signals the
+            # process group directly from another thread, so a cancelled child is
+            # very often already reaped by the time this wait returns. Checking here
+            # too is what stops a deliberate stop being misreported as "exited -15".
+            return (False, _cancel_requested_for(workspace))
+        except subprocess.TimeoutExpired:
+            pass
+
+        if _cancel_requested_for(workspace):
+            _kill_process_group(proc)
+            return (False, True)
+
+        if time.monotonic() >= deadline:
+            _kill_process_group(proc)
+            return (True, False)
+
+
 def run_agent(
     *,
     label: str,
@@ -434,15 +550,19 @@ def run_agent(
                     # still billing. Verified: a bare kill left a live `sleep` behind.
                     start_new_session=True,
                 )
+                # Registered for the whole life of the child so a Cancel arriving
+                # mid-run can reach it. Unregistered in `finally` — a leaked entry
+                # would let a later cancel signal a recycled pid.
+                token = _register_agent(proc, workspace, label)
                 try:
-                    proc.wait(timeout=timeout_seconds)
-                    timed_out = False
-                except subprocess.TimeoutExpired:
-                    _kill_process_group(proc)
-                    timed_out = True
+                    timed_out, cancelled = _wait_with_cancel(
+                        proc, workspace, timeout_seconds
+                    )
+                finally:
+                    _unregister_agent(token)
             raw_out = live_path.read_text(encoding="utf-8", errors="replace")
-            raw_err = "" if not timed_out else raw_out[-2000:]
-            returncode: Optional[int] = None if timed_out else proc.returncode
+            raw_err = "" if not (timed_out or cancelled) else raw_out[-2000:]
+            returncode: Optional[int] = None if (timed_out or cancelled) else proc.returncode
         else:
             completed = subprocess.run(
                 cmd,
@@ -459,11 +579,16 @@ def run_agent(
             raw_err = completed.stderr or ""
             returncode = completed.returncode
             timed_out = False
+            # This branch runs only when no live log could be opened, which is rare.
+            # It uses a blocking subprocess.run, so it is not cancellable — stated
+            # here rather than pretended otherwise.
+            cancelled = False
     except subprocess.TimeoutExpired as exc:
         raw_out = exc.stdout if isinstance(exc.stdout, str) else ""
         raw_err = exc.stderr if isinstance(exc.stderr, str) else ""
         returncode = None
         timed_out = True
+        cancelled = False
     except OSError as exc:
         return {
             "ok": False,
@@ -489,8 +614,14 @@ def run_agent(
     wrote_something = bool(files["created"] or files["modified"])
     exited_clean = returncode == 0
 
-    if timed_out:
-        error: Optional[str] = f"{label} timed out after {timeout_seconds}s"
+    if cancelled:
+        # Distinct from a timeout on purpose. "Cancelled" means a human stopped this
+        # deliberately; reporting it as a timeout would misattribute the decision and
+        # invite a pointless retry. Any files written before the kill are still
+        # reported, because they really are on disk.
+        error: Optional[str] = f"{label} was cancelled by the operator"
+    elif timed_out:
+        error = f"{label} timed out after {timeout_seconds}s"
     elif not exited_clean:
         error = _elide(raw_err.strip() or f"{label} exited {returncode}", 600)
     elif expect_files and not wrote_something:
