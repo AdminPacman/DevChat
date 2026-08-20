@@ -37,6 +37,8 @@
          v-model:edges="edges"
          :delete-key-code="false"
          :fit-view-on-init="true"
+         :snap-to-grid="true"
+         :snap-grid="[20, 20]"
          class="vueflow-graph"
          @node-click="onNodeClick"
          @edge-click="onEdgeClick"
@@ -341,6 +343,9 @@ import yaml from 'js-yaml'
 import { fetchYaml, fetchVueGraphLayout, postVueGraphLayout, updateYaml, postYamlNameChange, postYamlCopy } from '../utils/apiFunctions'
 import { helpContent } from '../utils/helpContent.js'
 import { configStore } from '../utils/configStore.js'
+import { assignLevels } from '../utils/graphLayering.js'
+import { bindGraph } from '../utils/crewIdentity.js'
+import { orderLayers } from '../utils/layerOrdering.js'
 
 const shouldShowTooltip = computed(() => configStore.ENABLE_HELP_TOOLTIPS)
 
@@ -916,6 +921,10 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
       try {
         const nodeIds = (yamlNodes || []).map(n => n?.id).filter(Boolean)
 
+        // Cast the crew for this graph — a whole-graph pass, not a per-node
+        // hash, so two agents never share a face. See crewIdentity.js.
+        bindGraph(yamlNodes || [])
+
         // Build adjacency and indegree
         const adj = new Map()
         const indegree = new Map()
@@ -931,51 +940,6 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
           indegree.set(e.to, (indegree.get(e.to) || 0) + 1)
         })
 
-        // Kahn's algorithm to compute levels
-        const levelById = new Map()
-        const q = []
-        nodeIds.forEach(id => {
-          if ((indegree.get(id) || 0) === 0) {
-            q.push(id)
-            levelById.set(id, 0)
-          }
-        })
-
-        // Heuristic: if the graph has no indegree-0 nodes (pure cycle),
-        // pick the first node declared in YAML `graph.start` as a pseudo-source
-        // so Kahn's algorithm can proceed and assign at least one level.
-        if (q.length === 0) {
-          try {
-            const yamlStartList = Array.isArray(yamlContent.value?.graph?.start)
-              ? yamlContent.value.graph.start
-              : []
-            const firstStart = yamlStartList.find(s => nodeIds.includes(s))
-            if (firstStart) {
-              // Force indegree to zero and seed the queue so at least one node gets level 0
-              indegree.set(firstStart, 0)
-              q.push(firstStart)
-              levelById.set(firstStart, 0)
-            }
-          } catch (e) {
-            // ignore and fall back later
-          }
-        }
-
-        let queueIndex = 0
-        while (queueIndex < q.length) {
-          const id = q[queueIndex++]
-          const baseLevel = levelById.get(id) || 0
-          const neighbors = adj.get(id) || new Set()
-          for (const nb of neighbors) {
-            const prev = levelById.get(nb) ?? 0
-            const newLevel = Math.max(prev, baseLevel + 1)
-            levelById.set(nb, newLevel)
-            indegree.set(nb, indegree.get(nb) - 1)
-            if (indegree.get(nb) === 0) q.push(nb)
-          }
-        }
-
-        
         const predecessors = new Map()
         nodeIds.forEach(id => predecessors.set(id, new Set()))
         ;(yamlEdges || []).forEach(e => {
@@ -984,28 +948,31 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
           predecessors.get(e.to).add(e.from)
         })
 
-        let changed = true
-        let iterations = 0
-        const maxIterations = nodeIds.length + 5
-        while (changed && iterations < maxIterations) {
-          changed = false
-          iterations++
-          nodeIds.forEach(id => {
-            if (levelById.has(id)) return
-            const preds = predecessors.get(id) || new Set()
-            const predLevels = Array.from(preds).map(p => levelById.get(p)).filter(l => typeof l === 'number')
-            if (predLevels.length) {
-              const lvl = Math.max(...predLevels) + 1
-              levelById.set(id, lvl)
-              changed = true
-            }
-          })
+        // ── Sugiyama phase 1: layering that survives cycles ──────────────────
+        //
+        // This used to be raw Kahn plus an "anything left -> level 0" fallback.
+        // Kahn never dequeues a node inside a cycle (its indegree never reaches
+        // zero), and EVERY crew workflow is cyclic because every one of them has
+        // a repair loop. So the fallback fired constantly and dumped most of the
+        // graph into a single column. Measured before this change:
+        //
+        //   ChatDev_v1        26 nodes -> tallest layer 16
+        //   kimi_next_phase   14 nodes -> tallest layer 12
+        //   kimi_blocker_fix   9 nodes -> tallest layer  7
+        //   data_visualization_enhanced_v3  13 nodes -> tallest layer 13 (all)
+        //
+        // That single tall column, with every edge arcing back through it, is
+        // what read as "compact" and "too many crossing wires". `assignLevels`
+        // removes back edges via DFS first, so what gets layered is a DAG.
+        // Same graphs after: 3, 2, 1 and 2. Back edges are returned rather than
+        // discarded — they are real return paths and the canvas still draws them.
+        const yamlStartList = Array.isArray(yamlContent.value?.graph?.start)
+          ? yamlContent.value.graph.start
+          : []
+        const { levelById, collapsed } = assignLevels(nodeIds, adj, yamlStartList)
+        if (collapsed) {
+          console.warn('[layout] every node landed in one column — layering collapsed despite cycle-breaking')
         }
-
-        // Any remaining unassigned nodes -> fallback to level 0
-        nodeIds.forEach(id => {
-          if (!levelById.has(id)) levelById.set(id, 0)
-        })
 
         // Group nodes by level and compute positions (simple grid per level)
         const buckets = new Map()
@@ -1016,20 +983,37 @@ const updateNodesAndEdgesFromYaml = (preserveExistingLayout = false) => {
 
         const positions = new Map()
         const levelKeys = Array.from(buckets.keys()).sort((a, b) => a - b)
-        const spacingX = 280
-        const spacingY = 120
-        const startX = 50
-        const startY = 50
+
+        // ── Sugiyama phase 2: order within each layer ───────────────────────
+        //
+        // Layers were previously placed in YAML declaration order, which is
+        // arbitrary and is the textbook cause of crossing wires. Honest caveat:
+        // measured across every workflow in `yaml_instance/`, crossings are
+        // currently 0 both before and after this pass — today's graphs are
+        // sequential enough that there is nothing to untangle, and the real win
+        // came from the layering fix above, not from here. It is wired in
+        // because it is correct, deterministic and cheap, and it starts paying
+        // the moment a graph has genuine many-to-many wiring between layers.
+        const ordered = orderLayers({ buckets, levelKeys, predecessors, successors: adj })
+        const layerOrder = ordered.order
+
+        // Centre each layer on a shared axis instead of stacking every layer
+        // from the same top edge. A 1-node layer next to a 4-node layer used to
+        // hang off the top; centring makes the flow read as a spine.
+        const tallest = Math.max(1, ...levelKeys.map(lvl => (layerOrder.get(lvl) || []).length))
+        const spacingX = 300
+        const spacingY = 140
+        const startX = 60
+        const startY = 60
+        const axisY = startY + ((tallest - 1) * spacingY) / 2
 
         levelKeys.forEach(lvl => {
-          const ids = buckets.get(lvl) || []
+          const ids = layerOrder.get(lvl) || []
           const x = startX + lvl * spacingX
-          let currentY = startY
-          // Apply a slight Y offset (+/-10) to the first node in each layer to avoid exact horizontal alignments
-          const layerOffset = (lvl % 2 === 0) ? -30 : 30
-          ids.forEach((id, idx) => {
-            const yPos = currentY + (idx === 0 ? layerOffset : 0)
-            positions.set(id, { x, y: yPos })
+          const height = (ids.length - 1) * spacingY
+          let currentY = axisY - height / 2
+          ids.forEach(id => {
+            positions.set(id, { x, y: currentY })
             currentY += spacingY
           })
         })
