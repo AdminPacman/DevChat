@@ -207,6 +207,10 @@ class CycleExecutor:
         """
         iteration = 0
 
+        # Nodes outside the cycle that got triggered along the way. Accumulated
+        # rather than returned on sight — see the retrigger note below.
+        accumulated_external: Set[str] = set()
+
         while iteration < max_iterations:
             self.log_manager.debug(
                 f"Cycle {cycle_id} iteration {iteration + 1}/{max_iterations}"
@@ -231,25 +235,63 @@ class CycleExecutor:
             )
 
             if external_nodes:
-                self.log_manager.debug(
-                    f"Cycle {cycle_id} exited - external nodes triggered: {sorted(external_nodes)}"
-                )
-                return external_nodes
+                accumulated_external |= external_nodes
 
-            # Step 4: Check if initial node is retriggered
-            if not self._is_initial_node_retriggered(initial_node_id, cycle_nodes):
-                self.log_manager.debug(
-                    f"Cycle {cycle_id} completed - initial node not retriggered"
-                )
-                break
+            # Step 4: Check if initial node is retriggered.
+            #
+            # THIS ORDER IS THE FIX. Previously the method returned the moment ANY
+            # external node was triggered, WITHOUT ever reaching this check. That
+            # conflated two independent questions:
+            #
+            #   "did an edge leave the cycle?"        -> bookkeeping; the edge's own
+            #                                            `triggered` flag already handles
+            #                                            firing its target when the
+            #                                            top-level schedule reaches it
+            #   "should this cycle stop iterating?"   -> answered ONLY by whether the
+            #                                            entry node was retriggered
+            #
+            # A conditional edge can satisfy both at once. In the crew's own repair
+            # graph a NEEDS_WORK verdict fires Gate->Builder (the retry, internal) and
+            # Gate->Repair_Loop_Counter (external) in the same step. The old code saw
+            # the external one and abandoned the cycle — and because the cycle super-node
+            # is scheduled exactly once for the whole run, Builder was never revisited.
+            # The retry flag sat on the edge, untouched, and the run ended clean: no
+            # exception, no retry, and the human approval node downstream was skipped
+            # entirely because none of its predecessors ever fired.
+            #
+            # So: a retriggered entry node means KEEP LOOPING, even if work also left
+            # the cycle. External targets are accumulated and reported on the way out.
+            retriggered = self._is_initial_node_retriggered(initial_node_id, cycle_nodes)
 
-            iteration += 1
+            if retriggered:
+                if external_nodes:
+                    self.log_manager.debug(
+                        f"Cycle {cycle_id} triggered external nodes "
+                        f"{sorted(external_nodes)} AND retriggered its entry node "
+                        f"'{initial_node_id}' - continuing to iterate"
+                    )
+                iteration += 1
+                continue
+
+            if accumulated_external:
+                self.log_manager.debug(
+                    f"Cycle {cycle_id} exited - external nodes triggered: "
+                    f"{sorted(accumulated_external)}"
+                )
+                return accumulated_external
+
+            self.log_manager.debug(
+                f"Cycle {cycle_id} completed - initial node not retriggered"
+            )
+            break
 
         if iteration >= max_iterations:
+            # Loud, not debug: hitting the cap means a repair loop never converged,
+            # which a human needs to know about rather than find by reading logs.
             self.log_manager.warning(
                 f"Cycle {cycle_id} reached max iterations ({max_iterations})"
             )
-        return set()
+        return accumulated_external
     def _detect_cycles_in_scope(
         self,
         scope_nodes: List[str],
